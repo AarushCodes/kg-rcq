@@ -1,0 +1,69 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+
+from .hadamard import pad_last_dim, rotate_activation_block, signed_hadamard_q
+
+
+@dataclass
+class LinearCalibrationStats:
+    covariance: torch.Tensor
+    expert_importance: torch.Tensor
+    rotated_second_moments: torch.Tensor
+
+
+def accumulate_covariance_and_moments(
+    activations_by_expert: list[list[torch.Tensor]],
+    router_weights_by_expert: list[list[torch.Tensor]],
+    *,
+    num_experts: int,
+    input_dim: int,
+    block_size: int,
+    model_name: str,
+    layer_id: int,
+    linear_type: str,
+    eps: float = 1e-12,
+) -> LinearCalibrationStats:
+    """Accumulate router-weighted covariance and rotated diagonal moments.
+
+    Inputs are grouped by expert because `down` activations are expert-specific.
+    Each tensor in a group is shaped [input_dim].
+    """
+    dtype = activations_by_expert[0][0].dtype if activations_by_expert and activations_by_expert[0] else torch.float32
+    device = activations_by_expert[0][0].device if activations_by_expert and activations_by_expert[0] else torch.device("cpu")
+    covariance_sum = torch.zeros((input_dim, input_dim), dtype=dtype, device=device)
+    expert_usage = torch.zeros(num_experts, dtype=dtype, device=device)
+    padded_dim = ((input_dim + block_size - 1) // block_size) * block_size
+    num_blocks = padded_dim // block_size
+    moment_sum = torch.zeros((num_blocks, block_size), dtype=dtype, device=device)
+    total_weight = torch.zeros((), dtype=dtype, device=device)
+
+    for expert_id in range(num_experts):
+        for activation, router_weight in zip(activations_by_expert[expert_id], router_weights_by_expert[expert_id]):
+            weight = router_weight.square()
+            covariance_sum += weight * torch.outer(activation, activation)
+            expert_usage[expert_id] += weight
+            total_weight += weight
+
+            padded, _ = pad_last_dim(activation, block_size)
+            blocks = padded.reshape(num_blocks, block_size)
+            for block_index in range(num_blocks):
+                q = signed_hadamard_q(
+                    model_name,
+                    layer_id,
+                    linear_type,
+                    block_index,
+                    block_size,
+                    device=device,
+                    dtype=dtype,
+                )
+                rotated = rotate_activation_block(blocks[block_index], q)
+                moment_sum[block_index] += weight * rotated.square()
+
+    covariance = covariance_sum / (total_weight + eps)
+    rotated_second_moments = moment_sum / (total_weight + eps)
+    importance = expert_usage / (expert_usage.sum() + eps)
+    return LinearCalibrationStats(covariance, importance, rotated_second_moments)
+

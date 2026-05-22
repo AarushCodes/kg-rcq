@@ -5,12 +5,15 @@ from .decomposition import SharedDecomposition, choose_rank, decompose_shared_su
 from .hadamard import block_hadamard_matrix, deterministic_block_signs
 from .quantization import RescueConfig, QuantizedResidual, quantize_residuals
 from .storage import StorageBreakdown, expert_bpw
+from .toy_moe import QuantizedToyMoeLayer, ToyMoeLayer, quantize_toy_moe_layer
 
 __all__ = [
+    "QuantizedToyMoeLayer",
     "RescueConfig",
     "QuantizedResidual",
     "SharedDecomposition",
     "StorageBreakdown",
+    "ToyMoeLayer",
     "block_hadamard_matrix",
     "choose_rank",
     "decompose_shared_subspace",
@@ -18,4 +21,5 @@ __all__ = [
     "expert_bpw",
     "lloyd_max_codebook",
     "quantize_residuals",
+    "quantize_toy_moe_layer",
 ]
