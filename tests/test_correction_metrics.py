@@ -16,10 +16,41 @@ def test_online_channel_regression_recovers_affine_parameters():
     stats = OnlineChannelRegression(dim=5)
     stats.update(y[:32], yhat[:32])
     stats.update(y[32:], yhat[32:])
-    alpha, beta = stats.solve()
+    alpha, beta = stats.solve(identity_if_not_better=False)
 
     assert torch.allclose(alpha, alpha_true, atol=1e-5)
     assert torch.allclose(beta, beta_true, atol=1e-5)
+
+
+def test_online_channel_regression_keeps_identity_when_outputs_already_match():
+    torch.manual_seed(14)
+    yhat = torch.randn(64, 5)
+    stats = OnlineChannelRegression(dim=5)
+    stats.update(yhat, yhat)
+
+    alpha, beta = stats.solve()
+
+    assert torch.equal(alpha, torch.ones_like(alpha))
+    assert torch.equal(beta, torch.zeros_like(beta))
+
+
+def test_online_channel_regression_correction_is_non_worsening_per_channel_on_calibration():
+    torch.manual_seed(15)
+    yhat = torch.randn(128, 4)
+    y = yhat.clone()
+    y[:, 1] = 1.8 * yhat[:, 1] - 0.3
+    y[:, 2] = -0.2 * yhat[:, 2] + 0.7
+    y[:, 3] = yhat[:, 3] + 1e-9
+    stats = OnlineChannelRegression(dim=4)
+    stats.update(y, yhat)
+
+    alpha, beta = stats.solve()
+    identity_mse = (y - yhat).square().mean(dim=0)
+    corrected_mse = (y - (alpha * yhat + beta)).square().mean(dim=0)
+
+    assert torch.all(corrected_mse <= identity_mse + 1e-7)
+    assert alpha[0].item() == 1.0
+    assert beta[0].item() == 0.0
 
 
 def test_toy_routed_output_correction_reduces_calibration_mse():
@@ -48,4 +79,3 @@ def test_kl_divergence_summary_reports_expected_keys_and_zero_self_kl():
     summary = kl_divergence_summary(logits, logits.clone())
     assert set(summary) == {"mean", "p50", "p95", "p99", "max"}
     assert summary["max"] == 0.0
-

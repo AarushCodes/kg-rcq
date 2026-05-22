@@ -1330,3 +1330,48 @@ Config: rcq_1p75
 Report: effective bpw, KL, PPL, 4 downstream tasks
 Comparison: existing 2-bit and 3-bit baselines if available
 ```
+
+---
+
+## 21. Implementation clarification: affine correction identity fallback
+
+The routed MoE-output affine correction in Section 10 should not be allowed to
+damage channels that are already matched by the quantized path.
+
+For each output channel, first compute the closed-form affine correction from
+Section 10:
+
+```text
+alpha = Cov(y, yhat) / (Var(yhat) + eps)
+beta  = mean(y) - alpha * mean(yhat)
+```
+
+Then compare calibration MSE for the fitted correction against the identity
+mapping:
+
+```text
+identity_mse  = E[(y - yhat)^2]
+corrected_mse = E[(y - (alpha * yhat + beta))^2]
+```
+
+If `corrected_mse >= identity_mse` for that channel, store:
+
+```text
+alpha = 1
+beta = 0
+```
+
+Otherwise store the fitted `(alpha, beta)`.
+
+Rationale:
+
+- In full-rank or near-lossless debug configurations, the quantized expert path
+  can already match the full-precision path up to floating-point error because
+  the shared factors represent essentially the full matrix and the residual is
+  near zero.
+- The regularized denominator `Var(yhat) + eps` can otherwise shrink an already
+  correct channel slightly, producing a correction artifact.
+- The fallback is per-channel, uses only the allowed calibration pairs
+  `(y, yhat)`, and is non-worsening on calibration MSE.
+- This does not remove the need for calibration. It only prevents the correction
+  stage from changing channels where calibration shows no benefit.

@@ -16,6 +16,7 @@ class OnlineChannelRegression:
     def __post_init__(self) -> None:
         self.count = torch.zeros((), dtype=self.dtype, device=self.device)
         self.sum_y = torch.zeros(self.dim, dtype=self.dtype, device=self.device)
+        self.sum_y2 = torch.zeros(self.dim, dtype=self.dtype, device=self.device)
         self.sum_yhat = torch.zeros(self.dim, dtype=self.dtype, device=self.device)
         self.sum_yhat2 = torch.zeros(self.dim, dtype=self.dtype, device=self.device)
         self.sum_y_yhat = torch.zeros(self.dim, dtype=self.dtype, device=self.device)
@@ -29,11 +30,12 @@ class OnlineChannelRegression:
         flat_yhat = yhat.reshape(-1, self.dim).to(dtype=self.dtype, device=self.device)
         self.count += flat_y.shape[0]
         self.sum_y += flat_y.sum(dim=0)
+        self.sum_y2 += flat_y.square().sum(dim=0)
         self.sum_yhat += flat_yhat.sum(dim=0)
         self.sum_yhat2 += flat_yhat.square().sum(dim=0)
         self.sum_y_yhat += (flat_y * flat_yhat).sum(dim=0)
 
-    def solve(self, *, eps: float = 1e-8) -> tuple[torch.Tensor, torch.Tensor]:
+    def solve(self, *, eps: float = 1e-8, identity_if_not_better: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
         if self.count.item() == 0:
             raise ValueError("cannot solve affine correction with zero samples.")
         mean_y = self.sum_y / self.count
@@ -42,5 +44,17 @@ class OnlineChannelRegression:
         cov = self.sum_y_yhat / self.count - mean_y * mean_yhat
         alpha = cov / (var_yhat + eps)
         beta = mean_y - alpha * mean_yhat
+        if identity_if_not_better:
+            identity_mse = (self.sum_y2 - 2.0 * self.sum_y_yhat + self.sum_yhat2) / self.count
+            corrected_mse = (
+                self.sum_y2
+                - 2.0 * alpha * self.sum_y_yhat
+                - 2.0 * beta * self.sum_y
+                + alpha.square() * self.sum_yhat2
+                + 2.0 * alpha * beta * self.sum_yhat
+                + beta.square() * self.count
+            ) / self.count
+            use_identity = corrected_mse >= identity_mse
+            alpha = torch.where(use_identity, torch.ones_like(alpha), alpha)
+            beta = torch.where(use_identity, torch.zeros_like(beta), beta)
         return alpha, beta
-

@@ -25,7 +25,7 @@ def test_full_rank_rcq_conversion_preserves_tiny_qwen_logits_closely():
         calibration_ids,
         RescueConfig.rcq_1p75(block_size=8),
         rank=8,
-        fit_correction=False,
+        fit_correction=True,
     )
 
     assert isinstance(q_model, TinyQwen35MoeRCQForCausalLM)
