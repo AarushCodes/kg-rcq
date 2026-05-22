@@ -7,6 +7,7 @@ import torch
 from .decomposition import SharedDecomposition, decompose_shared_subspace
 from .quantization import QuantizedResidual, RescueConfig, quantize_residuals
 from .stats import LinearCalibrationStats, accumulate_covariance_and_moments
+from .correction import OnlineChannelRegression
 
 
 @dataclass
@@ -94,6 +95,8 @@ class QuantizedToyMoeLayer:
     q_up: QuantizedLinearSet
     q_down: QuantizedLinearSet
     top_k: int
+    correction_alpha: torch.Tensor | None = None
+    correction_beta: torch.Tensor | None = None
 
     @property
     def num_experts(self) -> int:
@@ -111,7 +114,7 @@ class QuantizedToyMoeLayer:
         down_input = gate * up
         return self.q_down.forward(down_input, expert_id)
 
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden: torch.Tensor, *, apply_correction: bool = True) -> torch.Tensor:
         indices, weights = self.route(hidden)
         output = torch.zeros_like(hidden)
         for slot in range(self.top_k):
@@ -121,7 +124,16 @@ class QuantizedToyMoeLayer:
                 mask = expert_ids == expert_id
                 if mask.any():
                     output[mask] += router_weights[mask, None] * self.expert_forward(hidden[mask], expert_id)
+        if apply_correction and self.correction_alpha is not None and self.correction_beta is not None:
+            output = self.correction_alpha.to(output.device, output.dtype) * output + self.correction_beta.to(output.device, output.dtype)
         return output
+
+    def width_counts(self) -> dict[str, dict[int, int]]:
+        counts: dict[str, dict[int, int]] = {}
+        for name, linear in (("gate", self.q_gate), ("up", self.q_up), ("down", self.q_down)):
+            widths = torch.cat([q.widths.reshape(-1) for q in linear.q_residuals])
+            counts[name] = {bit: int((widths == bit).sum().item()) for bit in (1, 2, 4)}
+        return counts
 
 
 def collect_toy_calibration_stats(
@@ -235,4 +247,23 @@ def quantize_toy_moe_layer(
         q_down=_quantize_linear_type(layer.expert_down, stats["down"], config, model_name=model_name, layer_id=layer_id, linear_type="down", rank=rank),
         top_k=layer.top_k,
     )
+
+
+def fit_toy_moe_output_correction(
+    fp_layer: ToyMoeLayer,
+    q_layer: QuantizedToyMoeLayer,
+    hidden: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fit per-channel affine correction on routed aggregate MoE outputs."""
+    stats = OnlineChannelRegression(dim=hidden.shape[-1], dtype=hidden.dtype, device=hidden.device)
+    with torch.no_grad():
+        y_fp = fp_layer.forward(hidden)
+        y_q = q_layer.forward(hidden, apply_correction=False)
+        stats.update(y_fp, y_q)
+        alpha, beta = stats.solve(eps=eps)
+    q_layer.correction_alpha = alpha
+    q_layer.correction_beta = beta
+    return alpha, beta
 
