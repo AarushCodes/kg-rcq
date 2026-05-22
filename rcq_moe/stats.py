@@ -31,8 +31,11 @@ def accumulate_covariance_and_moments(
     Inputs are grouped by expert because `down` activations are expert-specific.
     Each tensor in a group is shaped [input_dim].
     """
-    dtype = activations_by_expert[0][0].dtype if activations_by_expert and activations_by_expert[0] else torch.float32
-    device = activations_by_expert[0][0].device if activations_by_expert and activations_by_expert[0] else torch.device("cpu")
+    first_activation = next((items[0] for items in activations_by_expert if items), None)
+    if first_activation is None:
+        raise ValueError("at least one calibration activation is required.")
+    dtype = first_activation.dtype
+    device = first_activation.device
     covariance_sum = torch.zeros((input_dim, input_dim), dtype=dtype, device=device)
     expert_usage = torch.zeros(num_experts, dtype=dtype, device=device)
     padded_dim = ((input_dim + block_size - 1) // block_size) * block_size
@@ -66,4 +69,3 @@ def accumulate_covariance_and_moments(
     rotated_second_moments = moment_sum / (total_weight + eps)
     importance = expert_usage / (expert_usage.sum() + eps)
     return LinearCalibrationStats(covariance, importance, rotated_second_moments)
-
