@@ -1,4 +1,4 @@
 outputs/
+data/text_fixtures/generated/
 __pycache__/
 .pytest_cache/
-
