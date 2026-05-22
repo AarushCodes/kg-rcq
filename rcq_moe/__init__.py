@@ -2,6 +2,7 @@
 
 from .codebooks import lloyd_max_codebook
 from .correction import OnlineChannelRegression
+from .artifact import load_official_qwen_rcq_artifact, save_official_qwen_rcq_artifact
 from .decomposition import SharedDecomposition, choose_rank, decompose_shared_subspace
 from .hadamard import block_hadamard_matrix, deterministic_block_signs
 from .harness import OfficialQwenAblationResult, OfficialQwenHarnessResult, run_official_qwen_ablation, run_official_qwen_harness
@@ -38,10 +39,12 @@ __all__ = [
     "expert_bpw",
     "fit_toy_moe_output_correction",
     "kl_divergence_summary",
+    "load_official_qwen_rcq_artifact",
     "lloyd_max_codebook",
     "make_tiny_official_qwen35_moe",
     "quantize_residuals",
     "quantize_toy_moe_layer",
     "run_official_qwen_ablation",
     "run_official_qwen_harness",
+    "save_official_qwen_rcq_artifact",
 ]

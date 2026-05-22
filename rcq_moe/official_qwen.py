@@ -90,6 +90,37 @@ class OfficialQwen35MoeRCQExperts(nn.Module):
         return final_hidden_states
 
 
+def _make_linear_set_from_state(state: dict[str, torch.Tensor | int | str], prefix: str) -> OfficialQwen35RCQLinearSet:
+    residuals: list[QuantizedResidual] = []
+    num_experts = int(state[f"{prefix}.num_experts"])
+    residual_template = state[f"{prefix}.q0.values"]
+    for expert_id in range(num_experts):
+        residuals.append(
+            QuantizedResidual(
+                values=state[f"{prefix}.q{expert_id}.values"],
+                widths=state[f"{prefix}.q{expert_id}.widths"],
+                scales=state[f"{prefix}.q{expert_id}.scales"],
+                valid_cols=int(state[f"{prefix}.q{expert_id}.valid_cols"]),
+                block_size=int(state[f"{prefix}.q{expert_id}.block_size"]),
+                model_name=str(state[f"{prefix}.q{expert_id}.model_name"]),
+                layer_id=int(state[f"{prefix}.q{expert_id}.layer_id"]),
+                linear_type=str(state[f"{prefix}.q{expert_id}.linear_type"]),
+                expert_id=int(state[f"{prefix}.q{expert_id}.expert_id"]),
+                scores=state[f"{prefix}.q{expert_id}.scores"],
+            )
+        )
+    decomposition = SharedDecomposition(
+        a_factors=[state[f"{prefix}.a{expert_id}"] for expert_id in range(num_experts)],
+        b_shared=state[f"{prefix}.b_shared"],
+        residuals=[torch.empty(0, dtype=residual_template.dtype, device=residual_template.device) for _ in range(num_experts)],
+        eigvals=state[f"{prefix}.eigvals"],
+        eigvecs=state[f"{prefix}.eigvecs"],
+        v_r=state[f"{prefix}.v_r"],
+        captured_energy=float(state[f"{prefix}.captured_energy"]),
+    )
+    return OfficialQwen35RCQLinearSet(decomposition=decomposition, q_residuals=residuals)
+
+
 class OfficialQwen35MoeRCQSparseMoeBlock(nn.Module):
     """Official-Qwen compatible sparse MoE block with RCQ expert weights."""
 
