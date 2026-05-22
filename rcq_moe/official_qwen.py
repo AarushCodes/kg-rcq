@@ -25,6 +25,28 @@ class OfficialQwen35RCQLinearSet:
         return shared + residual
 
 
+@dataclass(frozen=True)
+class OfficialQwen35LinearDiagnostics:
+    linear_type: str
+    captured_energy: float
+    bpw: float
+    width_percentages: dict[int, float]
+
+
+@dataclass(frozen=True)
+class OfficialQwen35LayerDiagnostics:
+    layer_id: int
+    linear_diagnostics: dict[str, OfficialQwen35LinearDiagnostics]
+    moe_mse_before_correction: float | None = None
+    moe_mse_after_correction: float | None = None
+
+
+@dataclass
+class OfficialQwen35RCQConversionResult:
+    model: nn.Module
+    layer_diagnostics: list[OfficialQwen35LayerDiagnostics]
+
+
 class OfficialQwen35MoeRCQExperts(nn.Module):
     """Drop-in replacement for official Qwen3.5-MoE experts."""
 
@@ -251,6 +273,38 @@ def _quantize_linear_set(
     return OfficialQwen35RCQLinearSet(decomposition=decomposition, q_residuals=q_residuals)
 
 
+def _linear_diagnostics(
+    linear_type: str,
+    linear_set: OfficialQwen35RCQLinearSet,
+    *,
+    rows: int,
+    cols: int,
+    rank: int,
+    block_size: int,
+    scale_bits: int,
+) -> OfficialQwen35LinearDiagnostics:
+    from .storage import expert_bpw
+
+    widths = torch.stack([q.widths for q in linear_set.q_residuals], dim=0)
+    report = expert_bpw(
+        num_experts=widths.shape[0],
+        rows=rows,
+        cols=cols,
+        rank=rank,
+        widths=widths,
+        block_size=block_size,
+        scale_bits_per_block=scale_bits,
+    )
+    total = widths.numel()
+    percentages = {bit: float((widths == bit).sum().item() / total) for bit in (1, 2, 4)}
+    return OfficialQwen35LinearDiagnostics(
+        linear_type=linear_type,
+        captured_energy=linear_set.decomposition.captured_energy,
+        bpw=report.bpw,
+        width_percentages=percentages,
+    )
+
+
 def _convert_block(
     fp_block: nn.Module,
     mlp_input: torch.Tensor,
@@ -259,28 +313,40 @@ def _convert_block(
     model_name: str,
     layer_id: int,
     rank: int | None,
-) -> OfficialQwen35MoeRCQSparseMoeBlock:
+) -> tuple[OfficialQwen35MoeRCQSparseMoeBlock, dict[str, OfficialQwen35LinearDiagnostics]]:
     stats = _collect_block_stats(fp_block, mlp_input, rcq_config, model_name=model_name, layer_id=layer_id)
     experts = fp_block.experts
     intermediate_dim = experts.intermediate_dim
     gate_weights = experts.gate_up_proj[:, :intermediate_dim, :]
     up_weights = experts.gate_up_proj[:, intermediate_dim:, :]
     down_weights = experts.down_proj
+    q_gate = _quantize_linear_set(gate_weights, stats["gate"], rcq_config, model_name=model_name, layer_id=layer_id, linear_type="gate", rank=rank)
+    q_up = _quantize_linear_set(up_weights, stats["up"], rcq_config, model_name=model_name, layer_id=layer_id, linear_type="up", rank=rank)
+    q_down = _quantize_linear_set(down_weights, stats["down"], rcq_config, model_name=model_name, layer_id=layer_id, linear_type="down", rank=rank)
     q_experts = OfficialQwen35MoeRCQExperts(
         num_experts=experts.num_experts,
         hidden_dim=experts.hidden_dim,
         intermediate_dim=intermediate_dim,
         act_fn=experts.act_fn,
-        q_gate=_quantize_linear_set(gate_weights, stats["gate"], rcq_config, model_name=model_name, layer_id=layer_id, linear_type="gate", rank=rank),
-        q_up=_quantize_linear_set(up_weights, stats["up"], rcq_config, model_name=model_name, layer_id=layer_id, linear_type="up", rank=rank),
-        q_down=_quantize_linear_set(down_weights, stats["down"], rcq_config, model_name=model_name, layer_id=layer_id, linear_type="down", rank=rank),
+        q_gate=q_gate,
+        q_up=q_up,
+        q_down=q_down,
     )
-    return OfficialQwen35MoeRCQSparseMoeBlock(
+    q_block = OfficialQwen35MoeRCQSparseMoeBlock(
         gate=copy.deepcopy(fp_block.gate),
         experts=q_experts,
         shared_expert=copy.deepcopy(fp_block.shared_expert),
         shared_expert_gate=copy.deepcopy(fp_block.shared_expert_gate),
     )
+    rank_gate = q_gate.decomposition.b_shared.shape[0]
+    rank_up = q_up.decomposition.b_shared.shape[0]
+    rank_down = q_down.decomposition.b_shared.shape[0]
+    diagnostics = {
+        "gate": _linear_diagnostics("gate", q_gate, rows=intermediate_dim, cols=experts.hidden_dim, rank=rank_gate, block_size=rcq_config.block_size, scale_bits=rcq_config.scale_bits),
+        "up": _linear_diagnostics("up", q_up, rows=intermediate_dim, cols=experts.hidden_dim, rank=rank_up, block_size=rcq_config.block_size, scale_bits=rcq_config.scale_bits),
+        "down": _linear_diagnostics("down", q_down, rows=experts.hidden_dim, cols=intermediate_dim, rank=rank_down, block_size=rcq_config.block_size, scale_bits=rcq_config.scale_bits),
+    }
+    return q_block, diagnostics
 
 
 def _fit_correction(
@@ -289,15 +355,20 @@ def _fit_correction(
     mlp_input: torch.Tensor,
     *,
     eps: float = 1e-8,
-) -> None:
+) -> tuple[float, float]:
     with torch.no_grad():
         y_fp = fp_block(mlp_input)
         y_q = q_block(mlp_input, apply_correction=False)
+    before = torch.mean((y_fp - y_q).square()).item()
     stats = OnlineChannelRegression(dim=mlp_input.shape[-1], dtype=mlp_input.dtype, device=mlp_input.device)
     stats.update(y_fp, y_q)
     alpha, beta = stats.solve(eps=eps)
     q_block.correction_alpha = alpha
     q_block.correction_beta = beta
+    with torch.no_grad():
+        y_corr = q_block(mlp_input, apply_correction=True)
+    after = torch.mean((y_fp - y_corr).square()).item()
+    return before, after
 
 
 def convert_official_qwen35_moe_to_rcq(
@@ -310,13 +381,34 @@ def convert_official_qwen35_moe_to_rcq(
     fit_correction: bool = True,
 ) -> nn.Module:
     """Deep-copy and convert official Transformers Qwen3.5-MoE experts to RCQ."""
+    return convert_official_qwen35_moe_to_rcq_with_diagnostics(
+        model,
+        calibration_input_ids,
+        rcq_config,
+        model_name=model_name,
+        rank=rank,
+        fit_correction=fit_correction,
+    ).model
+
+
+def convert_official_qwen35_moe_to_rcq_with_diagnostics(
+    model: nn.Module,
+    calibration_input_ids: torch.Tensor,
+    rcq_config: RescueConfig,
+    *,
+    model_name: str = "official-qwen3.5-moe",
+    rank: int | None = None,
+    fit_correction: bool = True,
+) -> OfficialQwen35RCQConversionResult:
+    """Deep-copy and convert official Transformers Qwen3.5-MoE experts to RCQ with diagnostics."""
     model.eval()
     mlp_inputs = collect_official_qwen_mlp_inputs(model, calibration_input_ids)
     q_model = copy.deepcopy(model)
     q_model.eval()
+    layer_diagnostics: list[OfficialQwen35LayerDiagnostics] = []
 
     for layer_id, (fp_layer, q_layer, mlp_input) in enumerate(zip(model.model.layers, q_model.model.layers, mlp_inputs)):
-        q_block = _convert_block(
+        q_block, linear_diags = _convert_block(
             fp_layer.mlp,
             mlp_input,
             rcq_config,
@@ -324,8 +416,17 @@ def convert_official_qwen35_moe_to_rcq(
             layer_id=layer_id,
             rank=rank,
         )
+        before = None
+        after = None
         if fit_correction:
-            _fit_correction(fp_layer.mlp, q_block, mlp_input)
+            before, after = _fit_correction(fp_layer.mlp, q_block, mlp_input)
         q_layer.mlp = q_block
-    return q_model
-
+        layer_diagnostics.append(
+            OfficialQwen35LayerDiagnostics(
+                layer_id=layer_id,
+                linear_diagnostics=linear_diags,
+                moe_mse_before_correction=before,
+                moe_mse_after_correction=after,
+            )
+        )
+    return OfficialQwen35RCQConversionResult(model=q_model, layer_diagnostics=layer_diagnostics)

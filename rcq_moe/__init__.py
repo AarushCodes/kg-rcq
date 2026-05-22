@@ -4,6 +4,7 @@ from .codebooks import lloyd_max_codebook
 from .correction import OnlineChannelRegression
 from .decomposition import SharedDecomposition, choose_rank, decompose_shared_subspace
 from .hadamard import block_hadamard_matrix, deterministic_block_signs
+from .harness import OfficialQwenAblationResult, OfficialQwenHarnessResult, run_official_qwen_ablation, run_official_qwen_harness
 from .metrics import kl_divergence_summary
 from .official_qwen import (
     OfficialQwen35MoeRCQExperts,
@@ -20,6 +21,8 @@ __all__ = [
     "OnlineChannelRegression",
     "OfficialQwen35MoeRCQExperts",
     "OfficialQwen35MoeRCQSparseMoeBlock",
+    "OfficialQwenAblationResult",
+    "OfficialQwenHarnessResult",
     "QuantizedToyMoeLayer",
     "RescueConfig",
     "QuantizedResidual",
@@ -39,4 +42,6 @@ __all__ = [
     "make_tiny_official_qwen35_moe",
     "quantize_residuals",
     "quantize_toy_moe_layer",
+    "run_official_qwen_ablation",
+    "run_official_qwen_harness",
 ]
