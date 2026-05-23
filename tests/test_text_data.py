@@ -9,7 +9,9 @@ from rcq_moe.text_data import (
     read_text_fixture,
     split_calib_eval,
     synthetic_fixture_documents,
+    texts_to_hf_token_batch,
     texts_to_input_ids,
+    texts_to_toy_token_batch,
     write_text_fixture,
 )
 
@@ -65,3 +67,35 @@ def test_texts_to_input_ids_fixed_shape_with_explicit_repeat():
     assert input_ids.dtype == torch.long
     assert int(input_ids.min()) >= 1
     assert int(input_ids.max()) < 8
+
+
+def test_toy_token_batch_returns_all_valid_attention_mask():
+    batch = texts_to_toy_token_batch(
+        ["abc"],
+        vocab_size=8,
+        config=TextBatchConfig(batch_size=1, sequence_length=6, max_batches=1, repeat_if_needed=True),
+    )
+
+    assert batch.input_ids.shape == (1, 6)
+    assert batch.attention_mask.shape == (1, 6)
+    assert torch.equal(batch.attention_mask, torch.ones_like(batch.attention_mask))
+
+
+def test_hf_token_batch_pads_short_text_and_marks_attention_mask():
+    class StubTokenizer:
+        pad_token_id = 0
+        eos_token_id = 2
+
+        def encode(self, text, *, add_special_tokens):
+            del add_special_tokens
+            return [(ord(char) % 17) + 3 for char in text if not char.isspace()]
+
+    batch = texts_to_hf_token_batch(
+        ["abc"],
+        tokenizer=StubTokenizer(),
+        config=TextBatchConfig(batch_size=2, sequence_length=4, max_batches=1, pad_if_needed=True),
+    )
+
+    assert batch.input_ids.shape == (2, 4)
+    assert batch.attention_mask.tolist() == [[1, 1, 1, 0], [0, 0, 0, 0]]
+    assert batch.input_ids[0, 3].item() == 0

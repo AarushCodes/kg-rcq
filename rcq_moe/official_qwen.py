@@ -186,7 +186,11 @@ def make_tiny_official_qwen35_moe(
     return Qwen3_5MoeForCausalLM(config)
 
 
-def collect_official_qwen_mlp_inputs(model: nn.Module, input_ids: torch.Tensor) -> list[torch.Tensor]:
+def collect_official_qwen_mlp_inputs(
+    model: nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+) -> list[torch.Tensor]:
     """Run the official model and capture inputs to each layer's MoE block."""
     captures: list[torch.Tensor | None] = [None] * len(model.model.layers)
     handles = []
@@ -200,7 +204,7 @@ def collect_official_qwen_mlp_inputs(model: nn.Module, input_ids: torch.Tensor) 
     was_training = model.training
     model.eval()
     with torch.no_grad():
-        model(input_ids=input_ids, use_cache=False)
+        model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
     if was_training:
         model.train()
     for handle in handles:
@@ -407,6 +411,7 @@ def convert_official_qwen35_moe_to_rcq(
     calibration_input_ids: torch.Tensor,
     rcq_config: RescueConfig,
     *,
+    calibration_attention_mask: torch.Tensor | None = None,
     model_name: str = "official-qwen3.5-moe",
     rank: int | None = None,
     fit_correction: bool = True,
@@ -416,6 +421,7 @@ def convert_official_qwen35_moe_to_rcq(
         model,
         calibration_input_ids,
         rcq_config,
+        calibration_attention_mask=calibration_attention_mask,
         model_name=model_name,
         rank=rank,
         fit_correction=fit_correction,
@@ -427,13 +433,14 @@ def convert_official_qwen35_moe_to_rcq_with_diagnostics(
     calibration_input_ids: torch.Tensor,
     rcq_config: RescueConfig,
     *,
+    calibration_attention_mask: torch.Tensor | None = None,
     model_name: str = "official-qwen3.5-moe",
     rank: int | None = None,
     fit_correction: bool = True,
 ) -> OfficialQwen35RCQConversionResult:
     """Deep-copy and convert official Transformers Qwen3.5-MoE experts to RCQ with diagnostics."""
     model.eval()
-    mlp_inputs = collect_official_qwen_mlp_inputs(model, calibration_input_ids)
+    mlp_inputs = collect_official_qwen_mlp_inputs(model, calibration_input_ids, attention_mask=calibration_attention_mask)
     q_model = copy.deepcopy(model)
     q_model.eval()
     layer_diagnostics: list[OfficialQwen35LayerDiagnostics] = []

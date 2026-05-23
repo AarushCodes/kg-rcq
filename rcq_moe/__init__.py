@@ -19,9 +19,12 @@ from .storage import StorageBreakdown, expert_bpw
 from .text_data import (
     TextBatchConfig,
     TextFixtureConfig,
+    TextTokenBatch,
     encode_texts_as_toy_byte_tokens,
     read_text_fixture,
+    texts_to_hf_token_batch,
     texts_to_input_ids,
+    texts_to_toy_token_batch,
 )
 from .toy_moe import QuantizedToyMoeLayer, ToyMoeLayer, fit_toy_moe_output_correction, quantize_toy_moe_layer
 
@@ -38,6 +41,7 @@ __all__ = [
     "StorageBreakdown",
     "TextBatchConfig",
     "TextFixtureConfig",
+    "TextTokenBatch",
     "ToyMoeLayer",
     "block_hadamard_matrix",
     "choose_rank",
@@ -58,5 +62,7 @@ __all__ = [
     "run_official_qwen_ablation",
     "run_official_qwen_harness",
     "save_official_qwen_rcq_artifact",
+    "texts_to_hf_token_batch",
     "texts_to_input_ids",
+    "texts_to_toy_token_batch",
 ]

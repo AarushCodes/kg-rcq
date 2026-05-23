@@ -35,21 +35,24 @@ def run_official_qwen_harness(
     eval_input_ids: torch.Tensor,
     rcq_config: RescueConfig,
     *,
+    calibration_attention_mask: torch.Tensor | None = None,
+    eval_attention_mask: torch.Tensor | None = None,
     rank: int,
     fit_correction: bool,
 ) -> OfficialQwenHarnessResult:
     model.eval()
     with torch.no_grad():
-        fp_logits = model(input_ids=eval_input_ids, use_cache=False).logits
+        fp_logits = model(input_ids=eval_input_ids, attention_mask=eval_attention_mask, use_cache=False).logits
     conversion = convert_official_qwen35_moe_to_rcq_with_diagnostics(
         model,
         calibration_input_ids,
         rcq_config,
+        calibration_attention_mask=calibration_attention_mask,
         rank=rank,
         fit_correction=fit_correction,
     )
     with torch.no_grad():
-        q_logits = conversion.model(input_ids=eval_input_ids, use_cache=False).logits
+        q_logits = conversion.model(input_ids=eval_input_ids, attention_mask=eval_attention_mask, use_cache=False).logits
     return OfficialQwenHarnessResult(
         model=conversion.model,
         kl=kl_divergence_summary(fp_logits, q_logits),
@@ -104,4 +107,3 @@ def run_official_qwen_ablation(
             )
         )
     return results
-
