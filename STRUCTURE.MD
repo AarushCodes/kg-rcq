@@ -1,6 +1,7 @@
 # Repository Structure
 
-This document covers the files under `rcq_moe/`, `scripts/`, and `tests/`.
+This document covers the files under `rcq_moe/`, `scripts/`, `kaggle/`, and
+`tests/`.
 It assumes the reader has already read `SUB2BIT_MOE_IMPLEMENTATION_SPEC.md`,
 so terms like router-weighted covariance, KLT, shared subspace, Hadamard
 rotation, rescue blocks, and routed MoE-output affine correction are used
@@ -32,7 +33,12 @@ artifacts, not source files to modify.
 │   ├── official_qwen_text_smoke.py
 │   ├── official_qwen_toy_ablation.py
 │   ├── official_qwen_toy_artifact.py
-│   └── official_qwen_toy_kl.py
+│   ├── official_qwen_toy_kl.py
+│   └── qwen36_fp_smoke.py
+├── kaggle/
+│   └── qwen36_fp_smoke/
+│       ├── kernel-metadata.json
+│       └── run_qwen36_fp_smoke.py
 └── tests/
     ├── fixtures/
     │   └── tiny_bert_tokenizer/
@@ -399,6 +405,65 @@ Contains:
 - Prints FP-vs-RCQ KL summary and per-layer linear diagnostics.
 
 Use this as the fastest end-to-end official-Qwen conversion metric script.
+
+### `scripts/qwen36_fp_smoke.py`
+
+FP-only pretrained Qwen3.6 smoke runner intended for remote GPU environments,
+especially the competition-attached Kaggle RTX PRO 6000 path.
+
+Contains:
+
+- CLI args for model ID, revision, dtype, device map, output directory, text
+  files, sequence length, and eval batch shape.
+- `--dry-run` mode that writes environment metadata without loading model
+  weights.
+- Hugging Face tokenizer/model loading with optional `HF_TOKEN`.
+- Tiny next-token loss pass using tokenizer-backed `TextTokenBatch`.
+- MoE/router/expert module structure inspection.
+- JSON/text outputs: `metadata.json`, `module_structure.txt`, and
+  `fp_metrics.json`.
+
+Use this for the first real Qwen3.6 slice. It deliberately does not quantize or
+save model weights.
+
+## `kaggle/`
+
+Kaggle script-kernel definitions used as remote GPU runners. These files should
+remain thin wrappers around committed local scripts so peer review and rollback
+stay anchored in git.
+
+### `kaggle/qwen36_fp_smoke/kernel-metadata.json`
+
+Kaggle metadata for the private script kernel
+`aarushkhilosia/rcq-qwen36-fp-smoke`.
+
+Contains:
+
+- `enable_gpu: true`.
+- `enable_internet: true`.
+- Competition attachment:
+  `nvidia-nemotron-model-reasoning-challenge`.
+- Script entrypoint `run_qwen36_fp_smoke.py`.
+
+Do not add credentials or model tokens here.
+
+### `kaggle/qwen36_fp_smoke/run_qwen36_fp_smoke.py`
+
+Thin Kaggle runner for the competition-attached Qwen3.6 FP-only smoke slice.
+
+Contains:
+
+- Required `RCQ_REPO_URL` environment variable.
+- Optional `RCQ_COMMIT_SHA` for exact commit checkout.
+- Optional `RCQ_GIT_TOKEN`, injected into HTTPS clone URLs without printing the
+  token in logs.
+- HF cache placement under `/kaggle/working/hf_cache`.
+- GPU verification via `nvidia-smi`.
+- Editable install of the cloned repo.
+- Execution of `scripts/qwen36_fp_smoke.py`, writing outputs under
+  `/kaggle/working/outputs/qwen36_fp_smoke`.
+
+This runner should be submitted with Kaggle API only after explicit permission.
 
 ## `tests/`
 

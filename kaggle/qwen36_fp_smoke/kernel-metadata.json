@@ -1,0 +1,15 @@
+{
+  "id": "aarushkhilosia/rcq-qwen36-fp-smoke",
+  "title": "RCQ Qwen3.6 FP Smoke",
+  "code_file": "run_qwen36_fp_smoke.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "competition_sources": [
+    "nvidia-nemotron-model-reasoning-challenge"
+  ],
+  "dataset_sources": [],
+  "kernel_sources": []
+}

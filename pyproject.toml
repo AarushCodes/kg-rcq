@@ -4,9 +4,11 @@ version = "0.1.0"
 description = "Reference PyTorch prototype for Router-Coherent Quantization of MoE expert weights."
 requires-python = ">=3.11"
 dependencies = [
+  "accelerate",
   "datasets",
   "huggingface-hub",
   "numpy",
+  "safetensors",
   "scipy",
   "tokenizers>=0.22.0,<=0.23.0",
   "torch",

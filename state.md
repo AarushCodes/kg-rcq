@@ -6,7 +6,9 @@ Current date: 2026-05-23
 
 The project has a working PyTorch reference prototype for RCQ-MoE, an official
 Transformers Qwen3.5-MoE tiny-model integration path, and a text-derived toy
-token harness with a real-tokenizer smoke path.
+token harness with a real-tokenizer smoke path. It now also has a local
+Kaggle script-kernel runner for a competition-attached Qwen3.6 FP-only smoke
+slice.
 
 This is still a research/plumbing prototype:
 
@@ -76,6 +78,23 @@ This is still a research/plumbing prototype:
   - Runs the official tiny Qwen3.5-MoE RCQ harness on text-derived tokens.
   - Saves and reloads the RCQ artifact after the text-token smoke run.
 
+- Kaggle remote execution scaffold:
+  - Adds `scripts/qwen36_fp_smoke.py` for FP-only pretrained Qwen3.6 smoke
+    runs on remote GPU hardware.
+  - Adds `kaggle/qwen36_fp_smoke/kernel-metadata.json` for the private Kaggle
+    script kernel `aarushkhilosia/rcq-qwen36-fp-smoke`.
+  - Attaches the Kaggle competition
+    `nvidia-nemotron-model-reasoning-challenge` and enables GPU/internet in
+    metadata.
+  - Adds `kaggle/qwen36_fp_smoke/run_qwen36_fp_smoke.py`, a thin runner that
+    clones the local repo from `RCQ_REPO_URL`, optionally checks out
+    `RCQ_COMMIT_SHA`, installs the package, verifies `nvidia-smi`, and runs the
+    FP smoke script.
+  - Keeps credentials out of source. `RCQ_GIT_TOKEN` is optional and redacted
+    from printed clone commands; `HF_TOKEN` is read only from the environment.
+  - Keeps Qwen3.6 model files on Kaggle under `/kaggle/working/hf_cache`, not
+    on the Mac.
+
 ## Generated Local Data
 
 Generated and intentionally ignored by git:
@@ -83,6 +102,7 @@ Generated and intentionally ignored by git:
 ```text
 data/text_fixtures/generated/fineweb_edu_256_calib.txt  347K
 data/text_fixtures/generated/fineweb_edu_256_eval.txt    80K
+outputs/qwen36_fp_smoke_dry_run/
 ```
 
 Generation command:
@@ -105,6 +125,22 @@ docs_total=256 docs_calib=205 docs_eval=51
 ```
 
 ## Validation
+
+Latest Qwen3.6 FP smoke dry-run command:
+
+```bash
+uv run python scripts/qwen36_fp_smoke.py \
+  --dry-run \
+  --output-dir outputs/qwen36_fp_smoke_dry_run
+```
+
+Latest Qwen3.6 FP smoke dry-run result:
+
+```text
+metadata.json, module_structure.txt, and fp_metrics.json written successfully.
+No pretrained model weights were loaded locally.
+No Kaggle command was run.
+```
 
 Latest full test command:
 
@@ -190,6 +226,7 @@ python3 scripts/official_qwen_toy_kl.py
 python3 scripts/official_qwen_toy_ablation.py
 python3 scripts/official_qwen_toy_artifact.py --clean
 python3 scripts/official_qwen_text_smoke.py --clean
+python3 scripts/qwen36_fp_smoke.py --dry-run --output-dir outputs/qwen36_fp_smoke_dry_run
 python3 scripts/build_text_fixture.py --source synthetic --prefix synthetic_toy --output-dir outputs/text_fixture_smoke
 ```
 
@@ -223,6 +260,8 @@ d9e481b Add official Qwen RCQ artifact roundtrip
 - No real pretrained Qwen/MoE checkpoint has been quantized.
 - No pretrained-model quality evaluation yet; slice 2 uses the real
   `Qwen/Qwen3.6-35B-A3B` tokenizer with a tiny random official Qwen-shaped model.
+- The competition-attached Kaggle Qwen3.6 FP smoke kernel has been created
+  locally but has not yet been pushed or run.
 - Current artifact stores fake-dequant reference tensors, not packed bitstreams.
 - No FP8 scale/shared-factor storage.
 - No fused kernels or performance benchmarks.
@@ -234,14 +273,17 @@ d9e481b Add official Qwen RCQ artifact roundtrip
 
 Continue the pretrained-compatible smoke path slice by slice:
 
-1. Slice 3: pretrained checkpoint FP-only smoke.
-   - Load the smallest available real MoE checkpoint or local Qwen3.5-MoE-
-     compatible checkpoint that fits the MacBook Air M2 memory budget.
+1. Slice 3: competition-attached Kaggle Qwen3.6 FP-only smoke.
+   - Push `kaggle/qwen36_fp_smoke` only after explicit permission.
+   - Run the private script kernel attached to
+     `nvidia-nemotron-model-reasoning-challenge`.
+   - Load `Qwen/Qwen3.6-35B-A3B` on Kaggle, not locally.
+   - Verify RTX PRO 6000 allocation with `nvidia-smi`.
    - Run tokenizer-driven FP-only eval and inspect/capture sparse MoE block
-     structure.
+     structure under `/kaggle/working/outputs/qwen36_fp_smoke`.
    - Do not quantize in this slice.
 2. Slice 4: one-layer pretrained RCQ conversion.
    - Add layer-limited conversion if needed.
-   - Quantize exactly one pretrained MoE layer/block first.
+   - Quantize exactly one Qwen3.6 MoE layer/block first on Kaggle.
    - Report FP-vs-one-layer-RCQ KL, routed MoE MSE before/after correction,
      expert bpw, artifact save/load exactness, and memory/runtime notes.
