@@ -16,6 +16,13 @@ from .official_qwen import (
 )
 from .quantization import RescueConfig, QuantizedResidual, quantize_residuals
 from .storage import StorageBreakdown, expert_bpw
+from .text_data import (
+    TextBatchConfig,
+    TextFixtureConfig,
+    encode_texts_as_toy_byte_tokens,
+    read_text_fixture,
+    texts_to_input_ids,
+)
 from .toy_moe import QuantizedToyMoeLayer, ToyMoeLayer, fit_toy_moe_output_correction, quantize_toy_moe_layer
 
 __all__ = [
@@ -29,6 +36,8 @@ __all__ = [
     "QuantizedResidual",
     "SharedDecomposition",
     "StorageBreakdown",
+    "TextBatchConfig",
+    "TextFixtureConfig",
     "ToyMoeLayer",
     "block_hadamard_matrix",
     "choose_rank",
@@ -36,6 +45,7 @@ __all__ = [
     "convert_official_qwen35_moe_to_rcq",
     "decompose_shared_subspace",
     "deterministic_block_signs",
+    "encode_texts_as_toy_byte_tokens",
     "expert_bpw",
     "fit_toy_moe_output_correction",
     "kl_divergence_summary",
@@ -44,7 +54,9 @@ __all__ = [
     "make_tiny_official_qwen35_moe",
     "quantize_residuals",
     "quantize_toy_moe_layer",
+    "read_text_fixture",
     "run_official_qwen_ablation",
     "run_official_qwen_harness",
     "save_official_qwen_rcq_artifact",
+    "texts_to_input_ids",
 ]

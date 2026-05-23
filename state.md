@@ -1,11 +1,12 @@
 # RCQ-MoE Prototype State
 
-Current date: 2026-05-22
+Current date: 2026-05-23
 
 ## Status
 
-The project has a working PyTorch reference prototype for RCQ-MoE and an official
-Transformers Qwen3.5-MoE tiny-model integration path.
+The project has a working PyTorch reference prototype for RCQ-MoE, an official
+Transformers Qwen3.5-MoE tiny-model integration path, and a text-derived toy
+token harness.
 
 This is still a research/plumbing prototype:
 
@@ -59,6 +60,10 @@ This is still a research/plumbing prototype:
   - Offline synthetic fixture source for tests.
   - Hugging Face streaming fixture builder.
   - Generated a local FineWeb-Edu 256-document fixture under ignored data.
+  - Reads local text fixture files back into documents.
+  - Converts text into deterministic toy byte-token `input_ids`.
+  - Runs the official tiny Qwen3.5-MoE RCQ harness on text-derived tokens.
+  - Saves and reloads the RCQ artifact after the text-token smoke run.
 
 ## Generated Local Data
 
@@ -93,14 +98,36 @@ docs_total=256 docs_calib=205 docs_eval=51
 Latest full test command:
 
 ```bash
-python3 -m pytest -q
+uv run pytest -q
 ```
 
 Latest result:
 
 ```text
-35 passed
+39 passed
 ```
+
+Latest text-token smoke command:
+
+```bash
+uv run python scripts/official_qwen_text_smoke.py --clean
+```
+
+Latest text-token smoke result:
+
+```text
+text_source=FineWeb-Edu generated fixture
+calib_docs=205 eval_docs=51
+calibration_ids_shape=(16, 32) eval_ids_shape=(4, 32)
+toy_text_fp_vs_rcq_kl mean=1.2730507e-07 p95=4.6927602e-07 max=7.6539436e-07
+max_abs_logit_delta_converted_vs_loaded=0
+kl_converted_vs_loaded mean=0 max=0
+```
+
+Interpretation: this is a tiny random-model plumbing metric only. It verifies
+text loading, deterministic toy tokenization, official Qwen RCQ conversion,
+diagnostics, artifact save, and artifact reload. It is not evidence of
+pretrained model quality.
 
 Known warnings:
 
@@ -134,12 +161,15 @@ transformers 5.9.0 requires tokenizers >=0.22.0, <=0.23.0
 Do not blindly upgrade `tokenizers` beyond `0.23.0` unless `transformers` is
 also upgraded to a compatible version.
 
+`uv.lock` is tracked for environment reproducibility.
+
 ## Useful Scripts
 
 ```bash
 python3 scripts/official_qwen_toy_kl.py
 python3 scripts/official_qwen_toy_ablation.py
 python3 scripts/official_qwen_toy_artifact.py --clean
+python3 scripts/official_qwen_text_smoke.py --clean
 python3 scripts/build_text_fixture.py --source synthetic --prefix synthetic_toy --output-dir outputs/text_fixture_smoke
 ```
 
@@ -156,23 +186,23 @@ python3 scripts/build_text_fixture.py \
   --prefix fineweb_edu_256
 ```
 
-## Latest Commits
+## Recent Commits Before This State Update
 
 ```text
+54eb9cb Document current RCQ prototype state
 e872141 Add streamed text fixture builder
 d9e481b Add official Qwen RCQ artifact roundtrip
 123b749 Add official Qwen RCQ harness diagnostics
 5748bf7 Add official Qwen toy KL diagnostic
 548efa9 Add official Qwen MoE RCQ adapter
-30f5246 Guard affine correction with identity fallback
 ```
 
 ## Current Limitations
 
 - No real pretrained Qwen/MoE checkpoint has been quantized.
-- No real tokenizer-driven model quality evaluation yet.
-- FineWeb-Edu text fixture exists locally but is not yet wired into the model
-  harness as token batches.
+- No pretrained-model tokenizer-driven quality evaluation yet.
+- The current text harness uses deterministic toy byte tokens for tiny random
+  models, not a real Qwen tokenizer.
 - Current artifact stores fake-dequant reference tensors, not packed bitstreams.
 - No FP8 scale/shared-factor storage.
 - No fused kernels or performance benchmarks.
@@ -182,17 +212,12 @@ d9e481b Add official Qwen RCQ artifact roundtrip
 
 ## Recommended Next Milestone
 
-Build the real text-token harness:
+Move from tiny random text-token plumbing to a pretrained-compatible smoke path:
 
-1. Load text fixture files.
-2. Tokenize with either:
-   - a real tokenizer when available, or
-   - a deterministic tiny byte/char tokenizer for official tiny random models.
-3. Produce fixed-shape calibration/eval `input_ids`.
-4. Run official Qwen RCQ harness on text-derived tokens.
-5. Save and reload RCQ artifact.
-6. Report toy text KL and diagnostics, clearly labeled as plumbing metrics.
-
-This should still run on the tiny official Qwen3.5-MoE model before attempting
-any real pretrained checkpoint.
-
+1. Add an optional real Hugging Face tokenizer path for text fixtures.
+2. Build calibration/eval `input_ids` with attention masks where needed.
+3. Select the smallest available MoE checkpoint or local Qwen3.5-MoE-compatible
+   checkpoint that fits the MacBook Air M2 memory budget.
+4. Run a one-layer or one-block RCQ conversion first, then expand only after
+   KL/artifact diagnostics pass.
+5. Keep the current toy byte-token harness as the no-network regression test.
