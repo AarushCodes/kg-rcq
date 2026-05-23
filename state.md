@@ -6,7 +6,7 @@ Current date: 2026-05-23
 
 The project has a working PyTorch reference prototype for RCQ-MoE, an official
 Transformers Qwen3.5-MoE tiny-model integration path, and a text-derived toy
-token harness.
+token harness with a real-tokenizer smoke path.
 
 This is still a research/plumbing prototype:
 
@@ -66,6 +66,11 @@ This is still a research/plumbing prototype:
     `attention_mask`.
   - Supports optional Hugging Face tokenizer encoding in
     `scripts/official_qwen_text_smoke.py` via `--tokenizer-name-or-path`.
+  - Has a checked-in tiny BERT tokenizer fixture for no-network AutoTokenizer
+    unit coverage.
+  - Validated slice 2 with `AutoTokenizer.from_pretrained` for
+    `Qwen/Qwen3.6-35B-A3B`, then reran the smoke with
+    `--tokenizer-local-files-only`.
   - Threads optional calibration/eval attention masks through the official Qwen
     capture, conversion, and KL harness paths.
   - Runs the official tiny Qwen3.5-MoE RCQ harness on text-derived tokens.
@@ -110,32 +115,39 @@ uv run pytest -q
 Latest result:
 
 ```text
-41 passed
+43 passed
 ```
 
 Latest text-token smoke command:
 
 ```bash
-uv run python scripts/official_qwen_text_smoke.py --clean
+uv run python scripts/official_qwen_text_smoke.py \
+  --clean \
+  --tokenizer-name-or-path Qwen/Qwen3.6-35B-A3B \
+  --tokenizer-local-files-only \
+  --output-dir outputs/toy_official_qwen_text_smoke_qwen36_tokenizer
 ```
 
 Latest text-token smoke result:
 
 ```text
 text_source=files:/Users/ck/Desktop/aarush/inference_research/impl/data/text_fixtures/generated/fineweb_edu_256_calib.txt,/Users/ck/Desktop/aarush/inference_research/impl/data/text_fixtures/generated/fineweb_edu_256_eval.txt
-tokenization=toy_byte
+tokenization=hf_tokenizer:Qwen/Qwen3.6-35B-A3B
 calib_docs=205 eval_docs=51
 calibration_ids_shape=(16, 32) eval_ids_shape=(4, 32)
 calibration_attention_tokens=512 eval_attention_tokens=128
-toy_text_fp_vs_rcq_kl mean=1.2730507e-07 p95=4.6927602e-07 max=7.6539436e-07
+toy_text_fp_vs_rcq_kl=mean=6.1713831e-07, p50=4.7719027e-07, p95=4.4415056e-06, p99=5.9478944e-06, max=9.4008465e-06
+layer=0 moe_mse_before=9.1268459e-09 moe_mse_after=8.7941094e-09 bpw={'gate': 8.59375, 'up': 8.59375, 'down': 8.59375}
+layer=1 moe_mse_before=1.0904087e-08 moe_mse_after=1.085529e-08 bpw={'gate': 8.59375, 'up': 8.59375, 'down': 8.59375}
+artifact_dir=outputs/toy_official_qwen_text_smoke_qwen36_tokenizer
 max_abs_logit_delta_converted_vs_loaded=0
-kl_converted_vs_loaded mean=0 max=0
+kl_converted_vs_loaded=mean=0, p50=0, p95=0, p99=0, max=0
 ```
 
 Interpretation: this is a tiny random-model plumbing metric only. It verifies
-text loading, deterministic toy tokenization, attention-mask plumbing, official
-Qwen RCQ conversion, diagnostics, artifact save, and artifact reload. It is not
-evidence of pretrained model quality.
+text loading, Qwen tokenizer loading/cached local reuse, attention-mask plumbing,
+official Qwen RCQ conversion, diagnostics, artifact save, and artifact reload.
+It is not evidence of pretrained model quality.
 
 Known warnings:
 
@@ -209,10 +221,8 @@ d9e481b Add official Qwen RCQ artifact roundtrip
 ## Current Limitations
 
 - No real pretrained Qwen/MoE checkpoint has been quantized.
-- No pretrained-model tokenizer-driven quality evaluation yet.
-- The official text smoke now has an optional Hugging Face tokenizer path, but
-  the latest validated smoke still uses deterministic `toy_byte` tokenization
-  on a tiny random model, not a real Qwen tokenizer.
+- No pretrained-model quality evaluation yet; slice 2 uses the real
+  `Qwen/Qwen3.6-35B-A3B` tokenizer with a tiny random official Qwen-shaped model.
 - Current artifact stores fake-dequant reference tensors, not packed bitstreams.
 - No FP8 scale/shared-factor storage.
 - No fused kernels or performance benchmarks.
@@ -224,21 +234,13 @@ d9e481b Add official Qwen RCQ artifact roundtrip
 
 Continue the pretrained-compatible smoke path slice by slice:
 
-1. Slice 2: real-tokenizer tiny-random smoke.
-   - Run the new tokenizer path with an actual local Hugging Face tokenizer, or
-     add a tiny checked-in tokenizer fixture if no local tokenizer is available.
-   - Keep `local_files_only=True` for deterministic no-network validation.
-   - Verify tokenizer-derived `input_ids`, `attention_mask`, finite FP-vs-RCQ
-     KL, and exact converted-vs-loaded artifact logits.
-   - Keep the current toy byte-token harness as the default no-network
-     regression test.
-2. Slice 3: pretrained checkpoint FP-only smoke.
+1. Slice 3: pretrained checkpoint FP-only smoke.
    - Load the smallest available real MoE checkpoint or local Qwen3.5-MoE-
      compatible checkpoint that fits the MacBook Air M2 memory budget.
    - Run tokenizer-driven FP-only eval and inspect/capture sparse MoE block
      structure.
    - Do not quantize in this slice.
-3. Slice 4: one-layer pretrained RCQ conversion.
+2. Slice 4: one-layer pretrained RCQ conversion.
    - Add layer-limited conversion if needed.
    - Quantize exactly one pretrained MoE layer/block first.
    - Report FP-vs-one-layer-RCQ KL, routed MoE MSE before/after correction,

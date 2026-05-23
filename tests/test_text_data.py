@@ -1,4 +1,5 @@
 import torch
+from transformers import AutoTokenizer
 
 from rcq_moe.text_data import (
     TextBatchConfig,
@@ -14,6 +15,9 @@ from rcq_moe.text_data import (
     texts_to_toy_token_batch,
     write_text_fixture,
 )
+
+
+TINY_TOKENIZER_DIR = "tests/fixtures/tiny_bert_tokenizer"
 
 
 def test_normalize_text_collapses_whitespace_and_blank_lines():
@@ -99,3 +103,18 @@ def test_hf_token_batch_pads_short_text_and_marks_attention_mask():
     assert batch.input_ids.shape == (2, 4)
     assert batch.attention_mask.tolist() == [[1, 1, 1, 0], [0, 0, 0, 0]]
     assert batch.input_ids[0, 3].item() == 0
+
+
+def test_hf_token_batch_loads_local_auto_tokenizer_without_network():
+    tokenizer = AutoTokenizer.from_pretrained(TINY_TOKENIZER_DIR, local_files_only=True)
+    batch = texts_to_hf_token_batch(
+        ["Router coherent quantization for MoE experts."],
+        tokenizer=tokenizer,
+        config=TextBatchConfig(batch_size=1, sequence_length=10, max_batches=1, pad_if_needed=True),
+    )
+
+    assert len(tokenizer) == 34
+    assert batch.input_ids.shape == (1, 10)
+    assert batch.attention_mask.shape == (1, 10)
+    assert int(batch.input_ids.max()) < len(tokenizer)
+    assert 0 < int(batch.attention_mask.sum().item()) < 10
