@@ -135,6 +135,17 @@ This is still a research/plumbing prototype:
   - Still does not implement polling, `debug_shell`, GitHub result pushing, or
     one-layer RCQ conversion.
 
+- Public GitHub remote and first job branch:
+  - Added `origin` as `https://github.com/AarushCodes/kg-rcq.git`.
+  - Pushed local `main` to GitHub.
+  - Integrated the manually added GitHub `LICENSE` commit without force-pushing.
+  - Created and pushed a separate `kaggle-jobs` branch.
+  - Added `jobs/0001-control-plane-smoke.json` on `kaggle-jobs`.
+  - The first job runs `control_plane_smoke` and pins
+    `code_commit=212fbb2816a2bf52c4da5d2bc1d7e94be3dece56`, the worker
+    implementation commit.
+  - No Kaggle command was run in this setup slice.
+
 ## Generated Local Data
 
 Generated and intentionally ignored by git:
@@ -247,6 +258,15 @@ Added local job validation/dispatch, one-shot Kaggle runner, job templates, and
 tests. No Kaggle command was run and no pretrained model weights were loaded.
 ```
 
+Latest GitHub remote setup:
+
+```text
+origin=https://github.com/AarushCodes/kg-rcq.git
+main pushed to GitHub.
+kaggle-jobs pushed with jobs/0001-control-plane-smoke.json pinned to
+212fbb2816a2bf52c4da5d2bc1d7e94be3dece56.
+```
+
 Latest text-token smoke command:
 
 ```bash
@@ -340,6 +360,8 @@ python3 scripts/build_text_fixture.py \
 ## Recent Commits Before This State Update
 
 ```text
+42a158d Create LICENSE
+212fbb2 Add one-shot Kaggle remote worker
 8490012 Design Kaggle remote control workflow
 d370d5a Add Kaggle Qwen3.6 FP smoke notebook
 de335b9 Add Kaggle Qwen3.6 FP smoke runner
@@ -372,17 +394,12 @@ e872141 Add streamed text fixture builder
 
 Continue the pretrained-compatible smoke path slice by slice:
 
-1. Public GitHub + `kaggle-jobs` setup.
-   - Add a public GitHub remote for this repo.
-   - Push `main`.
-   - Create `kaggle-jobs` with `jobs/0001-control-plane-smoke.json` copied from
-     the checked-in template and updated to pin the current `main` commit.
-2. Kaggle control-plane smoke.
+1. Kaggle control-plane smoke.
    - Run one `control_plane_smoke` job from Kaggle.
    - Verify public GitHub clone, pinned checkout, GPU/env visibility, and
      `scripts/qwen36_fp_smoke.py --dry-run`.
    - Do not load Qwen weights in this slice.
-3. Competition-attached Kaggle Qwen3.6 FP-only smoke.
+2. Competition-attached Kaggle Qwen3.6 FP-only smoke.
    - Use a manually created Kaggle notebook for the RTX PRO 6000 allocation,
      because the API-pushed notebook landed on P100.
    - Attach `nvidia-nemotron-model-reasoning-challenge`, enable internet, and
@@ -394,7 +411,7 @@ Continue the pretrained-compatible smoke path slice by slice:
    - Run tokenizer-driven FP-only eval and inspect/capture sparse MoE block
      structure under `/kaggle/working/outputs/qwen36_fp_smoke`.
    - Do not quantize in this slice.
-4. Slice 4: one-layer pretrained RCQ conversion.
+3. Slice 4: one-layer pretrained RCQ conversion.
    - Add layer-limited conversion if needed.
    - Quantize exactly one Qwen3.6 MoE layer/block first on Kaggle.
    - Report FP-vs-one-layer-RCQ KL, routed MoE MSE before/after correction,
