@@ -160,7 +160,7 @@ This is still a research/plumbing prototype:
     of Qwen3.6 model weights.
 
 - Public README:
-  - Adds `README.MD`, copied from `readme_draft.md`.
+  - Adds `README.MD`, synced from `readme_draft.md`.
   - Summarizes RCQ-MoE motivation, research goals, compression recipe,
     related-work context, implementation status, planned validation, compute
     needs, repository map, and local reproduction commands.
@@ -301,8 +301,9 @@ path before running control_plane_smoke.
 Latest README slice:
 
 ```text
-README.MD copied from readme_draft.md. No tests were run because this was a
-documentation-only slice.
+README.MD resynced from readme_draft.md. The tiny-model KL wording was tightened
+so the README no longer presents the tiny/random KL value as a quality result.
+No tests were run because this was a documentation-only slice.
 ```
 
 Latest text-token smoke command:
@@ -398,6 +399,7 @@ python3 scripts/build_text_fixture.py \
 ## Recent Commits Before This State Update
 
 ```text
+790d488 Add public README
 039b6c5 Record Kaggle offline bootstrap constraint
 4560a4f Record GitHub remote setup
 42a158d Create LICENSE

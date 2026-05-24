@@ -157,14 +157,13 @@ Latest local test result:
 pytest: 63 passed
 ```
 
-Tiny randomly initialized Hugging Face Transformers `Qwen3_5Moe` text-token smoke result:
+Tiny randomly initialized Hugging Face Transformers `Qwen3_5Moe` text-token smoke tests produce finite KL diagnostics and exact artifact reload:
 
 ```text
-FP-vs-RCQ KL mean ≈ 6.17e-07
 artifact reload max_abs_logit_delta = 0
 ```
 
-This checks plumbing and math on tiny/random models. It is not evidence that the method preserves quality on a pretrained checkpoint.
+I am not treating the tiny-model KL value as a quality result. It mostly checks plumbing and numerical consistency on a tiny random model.
 
 ## planned validation
 
