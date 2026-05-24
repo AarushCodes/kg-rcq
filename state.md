@@ -9,7 +9,8 @@ Transformers Qwen3.5-MoE tiny-model integration path, and a text-derived toy
 token harness with a real-tokenizer smoke path. It now also has local Kaggle
 script and notebook runners for a competition-attached Qwen3.6 FP-only smoke
 slice, plus a local one-shot Kaggle remote-control worker driven by reviewed
-JSON job specs.
+JSON job specs. The repository now has a public-facing `README.MD` copied from
+the current README draft.
 
 This is still a research/plumbing prototype:
 
@@ -158,6 +159,16 @@ This is still a research/plumbing prototype:
     outputs, pinned commit identity, small output artifacts, and no local copy
     of Qwen3.6 model weights.
 
+- Public README:
+  - Adds `README.MD`, copied from `readme_draft.md`.
+  - Summarizes RCQ-MoE motivation, research goals, compression recipe,
+    related-work context, implementation status, planned validation, compute
+    needs, repository map, and local reproduction commands.
+  - States clearly that current tiny/random smoke results are plumbing checks,
+    not pretrained-model quality evidence.
+  - Does not add the local `readme_draft.md` or
+    `lambda_grant_application_draft.md` drafts to git.
+
 ## Generated Local Data
 
 Generated and intentionally ignored by git:
@@ -287,6 +298,13 @@ worker path cannot run there as-is. Next slice should add an offline bootstrap
 path before running control_plane_smoke.
 ```
 
+Latest README slice:
+
+```text
+README.MD copied from readme_draft.md. No tests were run because this was a
+documentation-only slice.
+```
+
 Latest text-token smoke command:
 
 ```bash
@@ -380,6 +398,8 @@ python3 scripts/build_text_fixture.py \
 ## Recent Commits Before This State Update
 
 ```text
+039b6c5 Record Kaggle offline bootstrap constraint
+4560a4f Record GitHub remote setup
 42a158d Create LICENSE
 212fbb2 Add one-shot Kaggle remote worker
 8490012 Design Kaggle remote control workflow

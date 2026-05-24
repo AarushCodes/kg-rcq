@@ -1,7 +1,7 @@
 # Repository Structure
 
-This document covers the files under `docs/`, `rcq_moe/`, `scripts/`,
-`kaggle/`, and `tests/`.
+This document covers the root project files plus files under `docs/`,
+`rcq_moe/`, `scripts/`, `kaggle/`, and `tests/`.
 It assumes the reader has already read `SUB2BIT_MOE_IMPLEMENTATION_SPEC.md`,
 so terms like router-weighted covariance, KLT, shared subspace, Hadamard
 rotation, rescue blocks, and routed MoE-output affine correction are used
@@ -12,6 +12,17 @@ artifacts, not source files to modify.
 
 ```text
 .
+├── .gitignore
+├── LICENSE
+├── README.MD
+├── STRUCTURE.MD
+├── SUB2BIT_MOE_IMPLEMENTATION_SPEC.md
+├── configuration_qwen3_5_moe.py
+├── modeling_qwen3_5_moe.py
+├── modular_qwen3_5_moe.py
+├── pyproject.toml
+├── state.md
+├── uv.lock
 ├── docs/
 │   └── specs/
 │       └── 2026-05-24-kaggle-remote-control-design.md
@@ -70,6 +81,73 @@ artifacts, not source files to modify.
     ├── test_tiny_qwen_rcq_conversion.py
     └── test_toy_pipeline.py
 ```
+
+## Root Files
+
+Top-level project documentation, metadata, and environment lock files.
+
+### `.gitignore`
+
+Ignore rules for generated local data, outputs, caches, and environment files.
+
+### `README.MD`
+
+Public project overview copied from `readme_draft.md`.
+
+Contains:
+
+- High-level RCQ-MoE motivation and research goal.
+- The compression recipe: router-weighted statistics, shared KLT/SVD subspace,
+  Hadamard-rotated residuals, weighted 1-bit quantization, mixed 2/4-bit rescue,
+  and routed MoE-output correction.
+- Related-work context for KBVQ-MoE, NVFP4-style numerical lessons, and
+  TurboQuant-style rotations/codebooks.
+- Current implementation status, latest local test count, tiny/random smoke
+  interpretation, planned validation, compute needs, repository map, and local
+  reproduction commands.
+
+Keep this readable for external reviewers. Do not put credentials, private
+Kaggle details, or unvalidated pretrained-quality claims here.
+
+### `LICENSE`
+
+Repository license added through GitHub.
+
+### `STRUCTURE.MD`
+
+This file. Keep it updated after successful slices that add, remove, or
+meaningfully repurpose files.
+
+### `SUB2BIT_MOE_IMPLEMENTATION_SPEC.md`
+
+Primary research and implementation spec for the RCQ-MoE method.
+
+### `configuration_qwen3_5_moe.py`
+
+Local Qwen3.5-MoE configuration reference file used for architecture inspection
+and compatibility work.
+
+### `modeling_qwen3_5_moe.py`
+
+Local Qwen3.5-MoE modeling reference file used while aligning the prototype with
+official Transformers module structure.
+
+### `modular_qwen3_5_moe.py`
+
+Local modular Qwen3.5-MoE reference file used for architecture inspection.
+
+### `pyproject.toml`
+
+Project metadata, runtime dependencies, and pytest configuration.
+
+### `state.md`
+
+Current project state, validation log, known limitations, and recommended next
+milestone.
+
+### `uv.lock`
+
+Tracked environment lockfile for reproducible local setup.
 
 ## `docs/`
 
