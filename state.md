@@ -1,13 +1,13 @@
 # RCQ-MoE Prototype State
 
-Current date: 2026-05-23
+Current date: 2026-05-24
 
 ## Status
 
 The project has a working PyTorch reference prototype for RCQ-MoE, an official
 Transformers Qwen3.5-MoE tiny-model integration path, and a text-derived toy
-token harness with a real-tokenizer smoke path. It now also has a local
-Kaggle script-kernel runner for a competition-attached Qwen3.6 FP-only smoke
+token harness with a real-tokenizer smoke path. It now also has local Kaggle
+script and notebook runners for a competition-attached Qwen3.6 FP-only smoke
 slice.
 
 This is still a research/plumbing prototype:
@@ -90,6 +90,15 @@ This is still a research/plumbing prototype:
     clones the local repo from `RCQ_REPO_URL`, optionally checks out
     `RCQ_COMMIT_SHA`, installs the package, verifies `nvidia-smi`, and runs the
     FP smoke script.
+  - Adds `kaggle/qwen36_fp_smoke_notebook/kernel-metadata.json` and
+    `kaggle/qwen36_fp_smoke_notebook/rcq_qwen36_fp_smoke.ipynb` for a private
+    notebook-kernel version of the same FP-only smoke slice.
+  - The notebook can either run the committed repo smoke script through
+    `RCQ_USE_REPO_RUNNER=1` plus `RCQ_REPO_URL`, or use its embedded fallback
+    FP-only smoke code when no remote repo is available.
+  - Kaggle API auth was configured locally in `~/.kaggle/kaggle.json`, verified
+    with `kaggle config view`, and `kaggle==2.1.2` is installed in the local
+    `.venv` for CLI operations.
   - Keeps credentials out of source. `RCQ_GIT_TOKEN` is optional and redacted
     from printed clone commands; `HF_TOKEN` is read only from the environment.
   - Keeps Qwen3.6 model files on Kaggle under `/kaggle/working/hf_cache`, not
@@ -140,6 +149,40 @@ Latest Qwen3.6 FP smoke dry-run result:
 metadata.json, module_structure.txt, and fp_metrics.json written successfully.
 No pretrained model weights were loaded locally.
 No Kaggle command was run.
+```
+
+Latest Kaggle notebook push command:
+
+```bash
+.venv/bin/kaggle kernels push -p kaggle/qwen36_fp_smoke_notebook
+```
+
+Latest Kaggle notebook push result:
+
+```text
+Kernel version 1 successfully pushed.
+URL: https://www.kaggle.com/code/aarushkhilosia/rcq-qwen3-6-fp-smoke-notebook
+```
+
+Latest Kaggle notebook status check:
+
+```bash
+.venv/bin/kaggle kernels status aarushkhilosia/rcq-qwen3-6-fp-smoke-notebook
+```
+
+Latest Kaggle notebook status result:
+
+```text
+KernelWorkerStatus.RUNNING
+```
+
+Important interpretation:
+
+```text
+The API-pushed notebook was observed running on a P100, not RTX PRO 6000.
+No useful Qwen3.6 FP output has been pulled yet.
+For the RTX PRO 6000 slice, prefer a manually created Kaggle notebook with the
+competition attached and the accelerator selected in the Kaggle UI.
 ```
 
 Latest full test command:
@@ -206,6 +249,7 @@ huggingface_hub 1.16.1
 scikit-learn 1.8.0
 numba 0.65.1
 librosa 0.11.0
+kaggle 2.1.2  # installed in local .venv for CLI auth/push/status
 ```
 
 Important constraint:
@@ -246,13 +290,13 @@ python3 scripts/build_text_fixture.py \
 ## Recent Commits Before This State Update
 
 ```text
+d370d5a Add Kaggle Qwen3.6 FP smoke notebook
+de335b9 Add Kaggle Qwen3.6 FP smoke runner
+b9a3a8e Add Qwen tokenizer smoke coverage
+2183cca Update RCQ prototype state
 3f3b713 Add tokenizer-backed text batches
 54eb9cb Document current RCQ prototype state
 e872141 Add streamed text fixture builder
-d9e481b Add official Qwen RCQ artifact roundtrip
-123b749 Add official Qwen RCQ harness diagnostics
-5748bf7 Add official Qwen toy KL diagnostic
-548efa9 Add official Qwen MoE RCQ adapter
 ```
 
 ## Current Limitations
@@ -260,8 +304,12 @@ d9e481b Add official Qwen RCQ artifact roundtrip
 - No real pretrained Qwen/MoE checkpoint has been quantized.
 - No pretrained-model quality evaluation yet; slice 2 uses the real
   `Qwen/Qwen3.6-35B-A3B` tokenizer with a tiny random official Qwen-shaped model.
-- The competition-attached Kaggle Qwen3.6 FP smoke kernel has been created
-  locally but has not yet been pushed or run.
+- The API-pushed competition-attached Kaggle notebook selected P100 rather than
+  RTX PRO 6000, so it is not the desired validation path for Slice 3.
+- No completed Kaggle Qwen3.6 FP smoke outputs have been pulled or interpreted.
+- There is not yet a git remote configured for the local repo, so Kaggle cannot
+  clone the exact committed repo unless a remote is added or the repo is
+  otherwise provided to Kaggle.
 - Current artifact stores fake-dequant reference tensors, not packed bitstreams.
 - No FP8 scale/shared-factor storage.
 - No fused kernels or performance benchmarks.
@@ -274,9 +322,14 @@ d9e481b Add official Qwen RCQ artifact roundtrip
 Continue the pretrained-compatible smoke path slice by slice:
 
 1. Slice 3: competition-attached Kaggle Qwen3.6 FP-only smoke.
-   - Push `kaggle/qwen36_fp_smoke` only after explicit permission.
-   - Run the private script kernel attached to
-     `nvidia-nemotron-model-reasoning-challenge`.
+   - Use a manually created Kaggle notebook for the RTX PRO 6000 allocation,
+     because the API-pushed notebook landed on P100.
+   - Attach `nvidia-nemotron-model-reasoning-challenge`, enable internet, and
+     select RTX PRO 6000 in the Kaggle UI.
+   - Add a git remote for this repo before using repo-clone bootstrap/worker
+     mode.
+   - If using an interactive worker, keep commands allowlisted and commit job
+     specs/results so the remote work remains peer-reviewable.
    - Load `Qwen/Qwen3.6-35B-A3B` on Kaggle, not locally.
    - Verify RTX PRO 6000 allocation with `nvidia-smi`.
    - Run tokenizer-driven FP-only eval and inspect/capture sparse MoE block

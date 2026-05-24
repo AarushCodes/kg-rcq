@@ -36,9 +36,12 @@ artifacts, not source files to modify.
 │   ├── official_qwen_toy_kl.py
 │   └── qwen36_fp_smoke.py
 ├── kaggle/
-│   └── qwen36_fp_smoke/
+│   ├── qwen36_fp_smoke/
+│   │   ├── kernel-metadata.json
+│   │   └── run_qwen36_fp_smoke.py
+│   └── qwen36_fp_smoke_notebook/
 │       ├── kernel-metadata.json
-│       └── run_qwen36_fp_smoke.py
+│       └── rcq_qwen36_fp_smoke.ipynb
 └── tests/
     ├── fixtures/
     │   └── tiny_bert_tokenizer/
@@ -428,9 +431,9 @@ save model weights.
 
 ## `kaggle/`
 
-Kaggle script-kernel definitions used as remote GPU runners. These files should
-remain thin wrappers around committed local scripts so peer review and rollback
-stay anchored in git.
+Kaggle script/notebook definitions used as remote GPU runners. These files
+should remain thin wrappers around committed local scripts where possible so
+peer review and rollback stay anchored in git.
 
 ### `kaggle/qwen36_fp_smoke/kernel-metadata.json`
 
@@ -464,6 +467,43 @@ Contains:
   `/kaggle/working/outputs/qwen36_fp_smoke`.
 
 This runner should be submitted with Kaggle API only after explicit permission.
+
+### `kaggle/qwen36_fp_smoke_notebook/kernel-metadata.json`
+
+Kaggle metadata for the private notebook kernel
+`aarushkhilosia/rcq-qwen3-6-fp-smoke-notebook`.
+
+Contains:
+
+- `kernel_type: notebook`.
+- `enable_gpu: true`.
+- `enable_internet: true`.
+- Competition attachment:
+  `nvidia-nemotron-model-reasoning-challenge`.
+- Notebook entrypoint `rcq_qwen36_fp_smoke.ipynb`.
+
+The CLI-pushed notebook can land on Kaggle's default GPU class. For the RTX PRO
+6000 slice, prefer a manually created Kaggle notebook with the accelerator set
+in the UI, then use a committed bootstrap/worker path from the repo.
+
+### `kaggle/qwen36_fp_smoke_notebook/rcq_qwen36_fp_smoke.ipynb`
+
+Notebook-backed FP-only Qwen3.6 smoke runner.
+
+Contains:
+
+- Kaggle secret import for optional `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`,
+  `RCQ_REPO_URL`, `RCQ_COMMIT_SHA`, and `RCQ_GIT_TOKEN`.
+- HF cache placement under `/kaggle/working/hf_cache`.
+- GPU verification via `nvidia-smi`.
+- Optional repo-runner mode controlled by `RCQ_USE_REPO_RUNNER=1`, which clones
+  `RCQ_REPO_URL`, optionally checks out `RCQ_COMMIT_SHA`, installs the repo, and
+  runs `scripts/qwen36_fp_smoke.py`.
+- Embedded fallback FP-only smoke code that loads the tokenizer/model, records
+  sparse MoE module structure, runs a tiny next-token loss pass, and writes
+  outputs under `/kaggle/working/outputs/qwen36_fp_smoke_notebook`.
+
+This notebook deliberately does not quantize or save model weights.
 
 ## `tests/`
 
