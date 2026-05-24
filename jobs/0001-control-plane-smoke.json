@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "job_id": "0001-control-plane-smoke",
+  "action": "control_plane_smoke",
+  "code_commit": "212fbb2816a2bf52c4da5d2bc1d7e94be3dece56",
+  "created_utc": "2026-05-24T00:00:00Z",
+  "reason": "Template for verifying public GitHub clone, pinned checkout, GPU visibility, and dry-run output.",
+  "params": {
+    "sequence_length": 256,
+    "eval_batch_size": 1,
+    "eval_batches": 1
+  }
+}
