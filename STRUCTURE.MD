@@ -26,6 +26,7 @@ artifacts, not source files to modify.
 │   ├── metrics.py
 │   ├── official_qwen.py
 │   ├── quantization.py
+│   ├── remote_jobs.py
 │   ├── stats.py
 │   ├── storage.py
 │   ├── text_data.py
@@ -39,6 +40,11 @@ artifacts, not source files to modify.
 │   ├── official_qwen_toy_kl.py
 │   └── qwen36_fp_smoke.py
 ├── kaggle/
+│   ├── remote_worker/
+│   │   ├── job_templates/
+│   │   │   ├── 0001-control-plane-smoke.json
+│   │   │   └── 0002-qwen36-fp-smoke.json
+│   │   └── run_job.py
 │   ├── qwen36_fp_smoke/
 │   │   ├── kernel-metadata.json
 │   │   └── run_qwen36_fp_smoke.py
@@ -58,6 +64,7 @@ artifacts, not source files to modify.
     ├── test_official_qwen_text_harness.py
     ├── test_rcq_decomposition.py
     ├── test_rcq_math.py
+    ├── test_remote_jobs.py
     ├── test_text_data.py
     ├── test_tiny_qwen_normal.py
     ├── test_tiny_qwen_rcq_conversion.py
@@ -83,7 +90,7 @@ Contains:
   and GitHub result pushing.
 - Output layout, secret handling, error handling, test plan, and slice plan.
 
-Use this as the reference before implementing the remote worker.
+Use this as the reference when reviewing or extending the remote worker.
 
 ## `rcq_moe/`
 
@@ -249,6 +256,28 @@ Contains:
 
 This file owns most of spec Sections 7 and 8. It is the first place to inspect
 for bit allocation, scale, rescue, or dequantization bugs.
+
+### `rcq_moe/remote_jobs.py`
+
+Validation and dispatch helpers for one-shot Kaggle remote jobs.
+
+Contains:
+
+- `RemoteJob` and `JobSpecError`.
+- Strict JSON schema validation for `schema_version=1` job specs.
+- Required `job_id`, `action`, `code_commit`, `created_utc`, `reason`, and
+  `params` fields.
+- Filesystem-safe job ID validation and filename/job ID matching.
+- Action allowlists for `control_plane_smoke` and `qwen36_fp_smoke`.
+- Reserved-action rejection for future `debug_shell`, one-layer RCQ, polling,
+  and GitHub result-pushing slices.
+- Param validation/defaulting and deterministic argv construction for
+  `scripts/qwen36_fp_smoke.py`.
+- Output-root containment checks, selected non-secret environment snapshots,
+  JSON writing, and local action execution with stdout/stderr capture.
+
+Use this as the local, testable control-plane core. It should not import Kaggle
+APIs or require GPU access.
 
 ### `rcq_moe/stats.py`
 
@@ -459,6 +488,42 @@ Kaggle script/notebook definitions used as remote GPU runners. These files
 should remain thin wrappers around committed local scripts where possible so
 peer review and rollback stay anchored in git.
 
+### `kaggle/remote_worker/run_job.py`
+
+One-shot Kaggle runner for reviewed JSON remote jobs.
+
+Contains:
+
+- Required `RCQ_REPO_URL` and `RCQ_JOB_PATH` environment inputs.
+- Optional `RCQ_JOB_REF`, defaulting to `kaggle-jobs`.
+- Clone of the public repo into `/kaggle/working/rcq_moe_impl`.
+- Clone of the job branch into `/kaggle/working/rcq_moe_jobs`.
+- Pre-checkout read of `code_commit`, then detached checkout of that exact
+  commit before importing `rcq_moe.remote_jobs`.
+- Validation of the selected job spec from the pinned code.
+- Output writing under `/kaggle/working/outputs/<job_id>/`.
+- `job.json`, `run_manifest.json`, stdout/stderr logs, selected environment
+  metadata, argv, git SHA, timing, status, and output-file listing.
+
+This runner executes exactly one job per invocation. It does not poll, push to
+GitHub, or implement `debug_shell`.
+
+### `kaggle/remote_worker/job_templates/0001-control-plane-smoke.json`
+
+Template JSON job spec for the first remote-control smoke run.
+
+Contains the `control_plane_smoke` action with placeholder `code_commit`.
+Copy this to `jobs/` on the `kaggle-jobs` branch and replace `code_commit`
+before use.
+
+### `kaggle/remote_worker/job_templates/0002-qwen36-fp-smoke.json`
+
+Template JSON job spec for the FP-only Qwen3.6 smoke run.
+
+Contains the `qwen36_fp_smoke` action with default model, batch, dtype, device
+map, trust-remote-code, and MoE module inspection params. Copy this to `jobs/`
+on the `kaggle-jobs` branch and replace `code_commit` before use.
+
 ### `kaggle/qwen36_fp_smoke/kernel-metadata.json`
 
 Kaggle metadata for the private script kernel
@@ -628,6 +693,23 @@ Covers:
 - Rescue block selection percentages for `rcq_1p75`.
 - Dequantized residual shapes.
 - Storage bpw accounting.
+
+### `tests/test_remote_jobs.py`
+
+Tests one-shot Kaggle remote job validation and local dispatch behavior.
+
+Covers:
+
+- Valid control-plane and FP smoke specs.
+- Deterministic argv construction.
+- Filename/job ID matching.
+- Missing required field rejection.
+- Unknown top-level field, action, and param rejection.
+- Reserved future action rejection.
+- Invalid commit and param value rejection.
+- Output-root containment checks.
+- Local `control_plane_smoke` dry-run execution through `run_action(...)`.
+- Checked-in job template validation.
 
 ### `tests/test_text_data.py`
 

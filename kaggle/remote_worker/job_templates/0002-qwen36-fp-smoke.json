@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "job_id": "0002-qwen36-fp-smoke",
+  "action": "qwen36_fp_smoke",
+  "code_commit": "0000000000000000000000000000000000000000",
+  "created_utc": "2026-05-24T00:00:00Z",
+  "reason": "Template for FP-only Qwen3.6 model-load and tiny next-token-loss smoke on Kaggle.",
+  "params": {
+    "model_id": "Qwen/Qwen3.6-35B-A3B",
+    "sequence_length": 256,
+    "eval_batch_size": 1,
+    "eval_batches": 1,
+    "dtype": "bfloat16",
+    "device_map": "auto",
+    "trust_remote_code": false,
+    "max_moe_modules": 200
+  }
+}
