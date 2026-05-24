@@ -1,7 +1,7 @@
 # Repository Structure
 
-This document covers the files under `rcq_moe/`, `scripts/`, `kaggle/`, and
-`tests/`.
+This document covers the files under `docs/`, `rcq_moe/`, `scripts/`,
+`kaggle/`, and `tests/`.
 It assumes the reader has already read `SUB2BIT_MOE_IMPLEMENTATION_SPEC.md`,
 so terms like router-weighted covariance, KLT, shared subspace, Hadamard
 rotation, rescue blocks, and routed MoE-output affine correction are used
@@ -12,6 +12,9 @@ artifacts, not source files to modify.
 
 ```text
 .
+├── docs/
+│   └── specs/
+│       └── 2026-05-24-kaggle-remote-control-design.md
 ├── rcq_moe/
 │   ├── __init__.py
 │   ├── artifact.py
@@ -60,6 +63,27 @@ artifacts, not source files to modify.
     ├── test_tiny_qwen_rcq_conversion.py
     └── test_toy_pipeline.py
 ```
+
+## `docs/`
+
+Design and planning documents that are committed before implementation slices.
+These are peer-review artifacts, not generated outputs.
+
+### `docs/specs/2026-05-24-kaggle-remote-control-design.md`
+
+Approved design for the next Kaggle remote-control slices.
+
+Contains:
+
+- A one-shot Kaggle worker architecture using a public GitHub repo plus a
+  separate `kaggle-jobs` branch.
+- JSON job-spec schema with required `code_commit` pinning.
+- Initial named actions for `control_plane_smoke` and `qwen36_fp_smoke`.
+- Reserved future actions for `debug_shell`, one-layer RCQ conversion, polling,
+  and GitHub result pushing.
+- Output layout, secret handling, error handling, test plan, and slice plan.
+
+Use this as the reference before implementing the remote worker.
 
 ## `rcq_moe/`
 

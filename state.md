@@ -8,7 +8,8 @@ The project has a working PyTorch reference prototype for RCQ-MoE, an official
 Transformers Qwen3.5-MoE tiny-model integration path, and a text-derived toy
 token harness with a real-tokenizer smoke path. It now also has local Kaggle
 script and notebook runners for a competition-attached Qwen3.6 FP-only smoke
-slice.
+slice, plus an approved design for a peer-reviewable one-shot Kaggle remote
+control plane driven by JSON job specs.
 
 This is still a research/plumbing prototype:
 
@@ -104,6 +105,19 @@ This is still a research/plumbing prototype:
   - Keeps Qwen3.6 model files on Kaggle under `/kaggle/working/hf_cache`, not
     on the Mac.
 
+- Kaggle remote-control design:
+  - Adds `docs/specs/2026-05-24-kaggle-remote-control-design.md`.
+  - Chooses a small JSON action framework using a public GitHub repo plus a
+    separate `kaggle-jobs` branch.
+  - Requires every job spec to pin the exact `main` commit through
+    `code_commit`.
+  - Starts with one-shot execution, not a long-running poller.
+  - Initial actions are `control_plane_smoke` and `qwen36_fp_smoke`.
+  - Reserves `debug_shell`, polling, GitHub result pushing, and one-layer RCQ
+    conversion for later approved slices.
+  - Keeps Kaggle results as output artifacts first; selected small summaries are
+    committed locally after review.
+
 ## Generated Local Data
 
 Generated and intentionally ignored by git:
@@ -195,6 +209,14 @@ Latest result:
 
 ```text
 43 passed
+```
+
+Latest design-doc slice:
+
+```text
+docs/specs/2026-05-24-kaggle-remote-control-design.md was written for the
+approved Kaggle remote-control plan. It is documentation-only; no Kaggle command
+was run and no worker code was added in this slice.
 ```
 
 Latest text-token smoke command:
@@ -321,21 +343,33 @@ e872141 Add streamed text fixture builder
 
 Continue the pretrained-compatible smoke path slice by slice:
 
-1. Slice 3: competition-attached Kaggle Qwen3.6 FP-only smoke.
+1. Remote worker implementation slice.
+   - Make this repo public on GitHub before the Kaggle run path depends on
+     cloning it.
+   - Add JSON job validation/dispatch and a one-shot Kaggle runner as described
+     in `docs/specs/2026-05-24-kaggle-remote-control-design.md`.
+   - Use `main` for code and `kaggle-jobs` for one-shot JSON job specs.
+   - Require every job to pin `code_commit`.
+   - Add local tests and a local dry-run path before running anything on
+     Kaggle.
+2. Kaggle control-plane smoke.
+   - Run one `control_plane_smoke` job from Kaggle.
+   - Verify public GitHub clone, pinned checkout, GPU/env visibility, and
+     `scripts/qwen36_fp_smoke.py --dry-run`.
+   - Do not load Qwen weights in this slice.
+3. Competition-attached Kaggle Qwen3.6 FP-only smoke.
    - Use a manually created Kaggle notebook for the RTX PRO 6000 allocation,
      because the API-pushed notebook landed on P100.
    - Attach `nvidia-nemotron-model-reasoning-challenge`, enable internet, and
      select RTX PRO 6000 in the Kaggle UI.
-   - Add a git remote for this repo before using repo-clone bootstrap/worker
-     mode.
-   - If using an interactive worker, keep commands allowlisted and commit job
-     specs/results so the remote work remains peer-reviewable.
+   - Use the one-shot JSON job worker so the remote work remains
+     peer-reviewable.
    - Load `Qwen/Qwen3.6-35B-A3B` on Kaggle, not locally.
    - Verify RTX PRO 6000 allocation with `nvidia-smi`.
    - Run tokenizer-driven FP-only eval and inspect/capture sparse MoE block
      structure under `/kaggle/working/outputs/qwen36_fp_smoke`.
    - Do not quantize in this slice.
-2. Slice 4: one-layer pretrained RCQ conversion.
+4. Slice 4: one-layer pretrained RCQ conversion.
    - Add layer-limited conversion if needed.
    - Quantize exactly one Qwen3.6 MoE layer/block first on Kaggle.
    - Report FP-vs-one-layer-RCQ KL, routed MoE MSE before/after correction,
