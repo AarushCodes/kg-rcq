@@ -137,7 +137,8 @@ This is still a research/plumbing prototype:
     one-layer RCQ conversion.
 
 - Public GitHub remote and first job branch:
-  - Added `origin` as `https://github.com/AarushCodes/kg-rcq.git`.
+  - Renamed the GitHub repo from `kg-rcq` to `rcq`.
+  - Current `origin` is `https://github.com/AarushCodes/rcq.git`.
   - Pushed local `main` to GitHub.
   - Integrated the manually added GitHub `LICENSE` commit without force-pushing.
   - Created and pushed a separate `kaggle-jobs` branch.
@@ -284,7 +285,7 @@ tests. No Kaggle command was run and no pretrained model weights were loaded.
 Latest GitHub remote setup:
 
 ```text
-origin=https://github.com/AarushCodes/kg-rcq.git
+origin=https://github.com/AarushCodes/rcq.git
 main pushed to GitHub.
 kaggle-jobs pushed with jobs/0001-control-plane-smoke.json pinned to
 212fbb2816a2bf52c4da5d2bc1d7e94be3dece56.
@@ -399,6 +400,7 @@ python3 scripts/build_text_fixture.py \
 ## Recent Commits Before This State Update
 
 ```text
+81a0599 Resync public README
 790d488 Add public README
 039b6c5 Record Kaggle offline bootstrap constraint
 4560a4f Record GitHub remote setup
