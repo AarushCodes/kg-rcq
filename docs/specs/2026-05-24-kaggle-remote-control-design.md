@@ -60,6 +60,26 @@ running the action.
 
 No GitHub write token is required on Kaggle for the initial workflow.
 
+## Current Kaggle Constraint
+
+The public-GitHub clone path assumes the selected Kaggle runtime has internet
+enabled. A manually created RTX PRO 6000 notebook was found to have internet
+disabled, so that path cannot fetch `run_job.py`, clone `main`, or clone
+`kaggle-jobs` directly from GitHub in that environment.
+
+The architecture still keeps GitHub as the source of truth, but the next slice
+must add an offline bootstrap path before the RTX PRO 6000 control-plane smoke.
+Acceptable directions are:
+
+- package a small repo snapshot or worker bundle as a Kaggle dataset;
+- paste a minimal bootstrap cell that contains the current one-shot worker and
+  job spec;
+- use a Kaggle input artifact generated from a reviewed GitHub commit.
+
+Any offline path must preserve the same review guarantees: pinned commit
+identity, exact job JSON copied into outputs, small artifacts only, and no
+large model files pulled back locally.
+
 ## Job Spec Schema
 
 Job specs are JSON files under `jobs/` on the `kaggle-jobs` branch. The file
@@ -199,12 +219,14 @@ Coverage:
 1. Make the repo public on GitHub.
 2. Commit worker code on `main`.
 3. Create a JSON job spec on `kaggle-jobs`, pinned to a `main` commit.
-4. Start one Kaggle notebook/script invocation with repo URL, job branch/ref,
-   and job path.
-5. Kaggle executes exactly one job.
-6. Kaggle writes small artifacts under `/kaggle/working/outputs/<job_id>/`.
-7. Local workflow inspects logs and JSON/text outputs.
-8. Successful slice summaries are committed locally into `state.md` and
+4. For an internet-enabled Kaggle runtime, start one notebook/script invocation
+   with repo URL, job branch/ref, and job path.
+5. For an internet-disabled RTX PRO 6000 runtime, provide an approved offline
+   worker/job bundle derived from the pinned GitHub commit.
+6. Kaggle executes exactly one job.
+7. Kaggle writes small artifacts under `/kaggle/working/outputs/<job_id>/`.
+8. Local workflow inspects logs and JSON/text outputs.
+9. Successful slice summaries are committed locally into `state.md` and
    `STRUCTURE.MD`.
 
 ## Output Layout
@@ -288,8 +310,9 @@ sample job templates. Validate locally with dry-run. Update `state.md` and
 
 ### Slice 3: Kaggle Control-Plane Smoke
 
-Run `control_plane_smoke` on Kaggle. Do not load Qwen weights. Inspect small
-artifacts and commit selected summaries.
+Run `control_plane_smoke` on Kaggle. If the RTX PRO 6000 runtime still has
+internet disabled, first add a reviewed offline bootstrap path. Do not load Qwen
+weights. Inspect small artifacts and commit selected summaries.
 
 ### Slice 4: Kaggle FP-Only Qwen3.6 Smoke
 

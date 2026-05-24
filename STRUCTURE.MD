@@ -89,6 +89,10 @@ Contains:
 - Reserved future actions for `debug_shell`, one-layer RCQ conversion, polling,
   and GitHub result pushing.
 - Output layout, secret handling, error handling, test plan, and slice plan.
+- Current architecture note that the public-GitHub clone path requires Kaggle
+  internet, while the observed RTX PRO 6000 notebook has internet disabled and
+  therefore needs a reviewed offline bootstrap path before the control-plane
+  smoke.
 
 Use this as the reference when reviewing or extending the remote worker.
 

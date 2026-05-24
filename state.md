@@ -146,6 +146,18 @@ This is still a research/plumbing prototype:
     implementation commit.
   - No Kaggle command was run in this setup slice.
 
+- Kaggle RTX PRO 6000 runtime constraint:
+  - The manually created RTX PRO 6000 Kaggle notebook currently has internet
+    disabled.
+  - The existing one-shot worker path assumes internet for fetching
+    `run_job.py`, cloning `main`, and cloning `kaggle-jobs`.
+  - The next control-plane slice therefore needs a reviewed offline bootstrap
+    path, such as a small Kaggle dataset/repo snapshot, pasted bootstrap cell,
+    or Kaggle input artifact generated from a pinned GitHub commit.
+  - The offline path must preserve the same guarantees: exact job JSON in
+    outputs, pinned commit identity, small output artifacts, and no local copy
+    of Qwen3.6 model weights.
+
 ## Generated Local Data
 
 Generated and intentionally ignored by git:
@@ -267,6 +279,14 @@ kaggle-jobs pushed with jobs/0001-control-plane-smoke.json pinned to
 212fbb2816a2bf52c4da5d2bc1d7e94be3dece56.
 ```
 
+Latest Kaggle architecture update:
+
+```text
+Manual RTX PRO 6000 Kaggle notebook has internet disabled, so the GitHub-clone
+worker path cannot run there as-is. Next slice should add an offline bootstrap
+path before running control_plane_smoke.
+```
+
 Latest text-token smoke command:
 
 ```bash
@@ -379,10 +399,9 @@ e872141 Add streamed text fixture builder
   `Qwen/Qwen3.6-35B-A3B` tokenizer with a tiny random official Qwen-shaped model.
 - The API-pushed competition-attached Kaggle notebook selected P100 rather than
   RTX PRO 6000, so it is not the desired validation path for Slice 3.
+- The manually created RTX PRO 6000 Kaggle notebook currently has internet
+  disabled, so the GitHub-clone worker path cannot run there as-is.
 - No completed Kaggle Qwen3.6 FP smoke outputs have been pulled or interpreted.
-- There is not yet a git remote configured for the local repo, so Kaggle cannot
-  clone the exact committed repo unless a remote is added or the repo is
-  otherwise provided to Kaggle.
 - Current artifact stores fake-dequant reference tensors, not packed bitstreams.
 - No FP8 scale/shared-factor storage.
 - No fused kernels or performance benchmarks.
@@ -394,24 +413,30 @@ e872141 Add streamed text fixture builder
 
 Continue the pretrained-compatible smoke path slice by slice:
 
-1. Kaggle control-plane smoke.
+1. Offline Kaggle bootstrap path for RTX PRO 6000.
+   - Keep GitHub as the reviewed source of truth.
+   - Add a way to provide the pinned worker/job bundle to an internet-disabled
+     Kaggle notebook.
+   - Preserve exact job JSON, pinned commit identity, small output artifacts,
+     and no local Qwen3.6 model files.
+2. Kaggle control-plane smoke.
    - Run one `control_plane_smoke` job from Kaggle.
-   - Verify public GitHub clone, pinned checkout, GPU/env visibility, and
+   - Verify pinned worker/job identity, GPU/env visibility, and
      `scripts/qwen36_fp_smoke.py --dry-run`.
    - Do not load Qwen weights in this slice.
-2. Competition-attached Kaggle Qwen3.6 FP-only smoke.
+3. Competition-attached Kaggle Qwen3.6 FP-only smoke.
    - Use a manually created Kaggle notebook for the RTX PRO 6000 allocation,
      because the API-pushed notebook landed on P100.
-   - Attach `nvidia-nemotron-model-reasoning-challenge`, enable internet, and
-     select RTX PRO 6000 in the Kaggle UI.
-   - Use the one-shot JSON job worker so the remote work remains
-     peer-reviewable.
+   - Attach `nvidia-nemotron-model-reasoning-challenge` and select RTX PRO 6000
+     in the Kaggle UI.
+   - Use the one-shot JSON job worker or its reviewed offline bootstrap
+     equivalent so the remote work remains peer-reviewable.
    - Load `Qwen/Qwen3.6-35B-A3B` on Kaggle, not locally.
    - Verify RTX PRO 6000 allocation with `nvidia-smi`.
    - Run tokenizer-driven FP-only eval and inspect/capture sparse MoE block
      structure under `/kaggle/working/outputs/qwen36_fp_smoke`.
    - Do not quantize in this slice.
-3. Slice 4: one-layer pretrained RCQ conversion.
+4. Slice 4: one-layer pretrained RCQ conversion.
    - Add layer-limited conversion if needed.
    - Quantize exactly one Qwen3.6 MoE layer/block first on Kaggle.
    - Report FP-vs-one-layer-RCQ KL, routed MoE MSE before/after correction,
