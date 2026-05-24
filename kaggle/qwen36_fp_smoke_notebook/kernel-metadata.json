@@ -1,0 +1,16 @@
+{
+  "id": "aarushkhilosia/rcq-qwen3-6-fp-smoke-notebook",
+  "title": "RCQ Qwen3.6 FP Smoke Notebook",
+  "code_file": "rcq_qwen36_fp_smoke.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "competition_sources": [
+    "nvidia-nemotron-model-reasoning-challenge"
+  ],
+  "dataset_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}
