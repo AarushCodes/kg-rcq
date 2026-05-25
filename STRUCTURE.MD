@@ -170,6 +170,9 @@ Contains:
 - A normal Python cell that recomputes only FP reference denominators and
   annotates an existing pilot `ablation_metrics.json` with NMSE, without
   rebuilding quantized ablations.
+- A Down V2 time-to-insight Python cell that pins the reviewed left-output
+  implementation commit, skips old non-Down-V2 rows through a synthetic resume
+  JSON, runs D0/D3/D4/D5/D6 by default, and packages compact outputs.
 - Result-bundle packaging instructions that include only compact JSON/log files,
   not model shards or Hugging Face cache contents.
 
@@ -251,6 +254,9 @@ Contains:
 - `load_official_qwen_rcq_artifact(...)`, which rebuilds a Transformers
   `Qwen3_5MoeForCausalLM`, loads non-expert weights, then replaces MoE blocks
   with RCQ blocks from serialized RCQ state.
+- Serialized RCQ state includes shared-mode metadata and, for Down V2
+  `left_output`, `u_shared`, per-expert `c_factors`, and output eigensystem
+  diagnostics.
 
 This is the place to change if the checkpoint layout, artifact version, or
 serialized RCQ tensor schema changes.
@@ -287,20 +293,27 @@ Section 21.
 
 ### `rcq_moe/decomposition.py`
 
-Router-aware shared-subspace decomposition.
+Router-aware shared-subspace decomposition and Down V2 shared output-basis
+decomposition.
 
 Contains:
 
 - `SharedDecomposition`, holding `a_factors`, `b_shared`, `residuals`, and
   `captured_energy`.
+- `SharedOutputDecomposition`, holding `u_shared`, per-expert `c_factors`,
+  residuals, eigensystem diagnostics, and output-energy captured.
 - `choose_rank(...)`, following the default rank rule with caps for tiny dims.
 - `klt_transform(...)`, including eigenvalue flooring and inverse transform.
 - `decompose_shared_subspace(...)`, which weights experts by importance, forms
   KLT-space stacked expert matrices, computes top right singular vectors, builds
   shared factors, and returns expert residuals.
+- `decompose_shared_output_subspace(...)`, which computes the shared
+  left/output basis for Down V2 `left_output` mode from router-weighted down
+  output covariance.
 
-This is the main implementation of spec Section 6. Bugs in shared/residual math
-usually trace here first.
+This is the main implementation of spec Section 6 plus the Down Projection V2
+left-output decomposition. Bugs in shared/residual math usually trace here
+first.
 
 ### `rcq_moe/hadamard.py`
 
@@ -353,16 +366,21 @@ Integration layer for official Transformers Qwen3.5-MoE-style models.
 Contains:
 
 - `OfficialQwen35RCQLinearSet`, a low-rank shared factor plus dequantized
-  residual reference linear path.
+  residual reference linear path supporting `right_input`, `none`, and
+  `left_output` shared modes.
 - Layer/linear diagnostic dataclasses for captured energy, bpw, rescue width
-  percentages, and correction MSE.
+  percentages, shared mode, rank, residual config, moment mode, and correction
+  MSE.
 - RCQ expert and sparse MoE block wrappers that preserve the router path while
   replacing expert linear projections.
 - Forward-hook based collection of MoE block inputs.
 - Per-block calibration stat collection for `gate`, `up`, and `down` expert
-  linears.
+  linears, including down output covariance for Down V2 left-output
+  decomposition.
 - Conversion helpers that deep-copy the FP model, quantize each MoE block, fit
   optional routed MoE-output correction, and return diagnostics.
+- Down V2 official-model conversion support for `shared_mode="none"` and
+  `shared_mode="left_output"`.
 - `make_tiny_official_qwen35_moe(...)`, used by tests/scripts to create a small
   official Transformers model shape without needing a pretrained checkpoint.
 
@@ -377,11 +395,16 @@ Residual quantization and mixed-bit rescue implementation.
 Contains:
 
 - `RescueConfig` plus exact `rcq_1p55`, `rcq_1p75`, and `rcq_1p90` presets.
+- Down-specific residual presets `down_mix_1bit`, `down_min2_5p4`, and
+  `down_min2_20p4`.
 - `QuantizedResidual`, including reference `dequantize()` reconstruction.
 - Binary sign quantization with activation-weighted scale.
 - Lloyd-Max rescue quantization for 2-bit and 4-bit blocks.
 - Row-block sensitivity scoring.
 - Global rescue-width selection per layer+linear type.
+- `min_bit=2` support for down residual configs with no 1-bit row-blocks.
+- Per-expert rotated second moments and optional expert score weights for Down
+  V2 quantization/scoring.
 - `quantize_residuals(...)`, which rotates residual blocks, assigns rescue
   widths, quantizes blocks, and stores per-block metadata/scales/indices.
 
@@ -417,10 +440,12 @@ Calibration statistic accumulation.
 Contains:
 
 - `LinearCalibrationStats`, holding covariance, expert importance, and rotated
-  second moments.
+  second moments, plus optional Down V2 per-expert moments, router-weight sums,
+  selected counts, global fallback moments, and down output covariance.
 - `accumulate_covariance_and_moments(...)`, which streams expert-grouped
   activations and router weights into router-weighted covariance, expert usage,
-  and per-block rotated activation diagonal moments.
+  per-block rotated activation diagonal moments, per-expert down moments, and
+  optional output covariance.
 
 This file implements the stat shape consumed by decomposition and residual
 quantization.
@@ -434,6 +459,7 @@ Contains:
 - `StorageBreakdown`.
 - `expert_bpw(...)`, which accounts for shared factors, residual index bits,
   scale bits, and 2-bit row-block metadata against original expert weights.
+  It supports `right_input`, `left_output`, and `none` shared-mode accounting.
 
 Update this if storage precision changes, metadata packing changes, or shared
 factor accounting changes.
@@ -652,6 +678,15 @@ Contains:
   `rcq_1p75`, `rcq_1p90`, routed MoE-output correction, rank variants, and
   explicit `not_available` markers for unavailable production/2-bit/KBVQ and
   grouped-subspace baselines.
+- Down Projection V2 D0-D7 rows:
+  D0 legacy-right baseline, D3/D4 down `none` min-2-bit configs, and D5/D6/D7
+  down `left_output` rows with sequential down stats.
+- Sequential down-stat collection for D5/D6/D7: quantize gate/up first, then
+  collect `activation(gate_Q) * up_Q` down moments and FP down-output
+  covariance using cached hidden states and router decisions.
+- Output fields for Down V2 reporting, including down shared mode, residual
+  config, moment mode, sequential-stat flag, gate/up/down bpw, average expert
+  bpw, and down legacy/left-output captured-energy diagnostics.
 - Compact outputs: `run_manifest.json`, `index_summary.json`,
   `nmse_denominators.json`, `ablation_metrics.partial.json`,
   `ablation_metrics.json`, and, for denominator-only annotation,
@@ -815,6 +850,8 @@ Covers:
 - Loaded model contains RCQ sparse MoE blocks.
 - `metadata.json`, `non_expert_state.pt`, and `rcq_state.pt` are written.
 - Metadata contains artifact format, model type, layer count, and diagnostics.
+- Down V2 `none` and `left_output` artifact round-trips preserve shared-mode
+  state and converted-vs-loaded logits.
 
 ### `tests/test_official_qwen_harness.py`
 
@@ -836,6 +873,8 @@ Covers:
 - Hook-based MoE input collection.
 - Full-rank RCQ conversion preserving logits with correction.
 - Low-rank RCQ conversion running successfully and producing finite KL.
+- Tiny official Qwen conversion runs with down shared modes `none` and
+  `left_output`.
 
 ### `tests/test_official_qwen_text_harness.py`
 
@@ -859,6 +898,8 @@ Covers:
 - KLT transform/inverse after eigenvalue flooring.
 - Shared subspace captures common expert structure.
 - Full-rank decomposition leaves near-zero residuals.
+- Down V2 left-output decomposition reconstructs full-rank weights, returns
+  low-rank factors with expected shapes, and rejects rank 0.
 
 ### `tests/test_rcq_math.py`
 
@@ -871,8 +912,11 @@ Covers:
 - Binary quantizer weighted scale behavior.
 - Lloyd rescue block quantization.
 - Rescue block selection percentages for `rcq_1p75`.
+- Down min-2 residual configs assign zero 1-bit row-blocks.
+- Per-expert moments are accepted by residual quantization.
+- Cold-expert shrinkage returns finite nonnegative moments.
 - Dequantized residual shapes.
-- Storage bpw accounting.
+- Storage bpw accounting for right-input, left-output, and no-shared modes.
 
 ### `tests/test_qwen36_single_layer_ablation.py`
 
@@ -885,6 +929,10 @@ Covers:
 - Dict-style config helper behavior so dry-run inspection does not require
   model registration when reading raw `config.json`.
 - NMSE denominator and annotation helper behavior using cached FP outputs.
+- Down V2 D-row construction and output field behavior.
+- Tiny-weight down `none` min-2 and down `left_output` execution.
+- Sequential down-stat collection from cached hidden states using quantized
+  gate/up.
 - Tiny-weight execution of the proxy debug path.
 - Tiny-weight execution of the true layer-0 attention activation path.
 

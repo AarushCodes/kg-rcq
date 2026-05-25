@@ -16,7 +16,9 @@ script now records ROCm-aware runtime metadata needed for the first MI300X
 control-plane dry-run. A Kaggle T4 x2 fallback has now produced a first
 pretrained, layer-local Qwen3.6 RCQ pilot on true layer-0 MoE inputs. The
 repository now has a public-facing `README.MD` copied from the current README
-draft.
+draft. The Down Projection V2 local implementation is now in place for both
+the no-shared min-2-bit path and the left-output shared-subspace path, with
+Kaggle commands prepared for the next layer-local D0/D3/D4/D5/D6 evidence run.
 
 This is still a research/plumbing prototype:
 
@@ -31,9 +33,14 @@ This is still a research/plumbing prototype:
   - Router-weighted covariance/statistics.
   - KLT/eigendecomposition shared subspace.
   - Shared low-rank decomposition.
+  - Down Projection V2 no-shared mode and shared left-output decomposition.
   - Block signed Hadamard rotations.
   - 1-bit weighted sign residual quantization.
   - 2/4-bit Lloyd-Max rescue quantization.
+  - Down-specific residual configs `down_mix_1bit`, `down_min2_5p4`, and
+    `down_min2_20p4`.
+  - Per-expert down rotated activation moments with cold-expert shrinkage to
+    global moments.
   - Effective expert bpw accounting.
 
 - Correction:
@@ -65,6 +72,8 @@ This is still a research/plumbing prototype:
   - Saves `metadata.json`, `non_expert_state.pt`, and `rcq_state.pt`.
   - Reloads RCQ official Qwen model without needing original FP expert tensors.
   - Converted-vs-loaded logits match exactly in toy tests.
+  - Round-trips Down V2 `shared_mode` metadata and left-output tensors in the
+    official-Qwen reference artifact.
 
 - Text fixture pipeline:
   - Offline synthetic fixture source for tests.
@@ -203,8 +212,16 @@ This is still a research/plumbing prototype:
   - Caches true MoE inputs, router decisions/weights, and FP routed MoE outputs
     once, then reuses them across ablations.
   - Supports partial-result resume via `--skip-completed-from`.
+  - Implements Down Projection V2 D0-D7 row definitions:
+    - D0 reproduces the current legacy-right `rcq_1p75` baseline.
+    - D3/D4 use gate/up `rcq_1p55` with down mode `none` and min-2-bit down
+      residual configs.
+    - D5/D6/D7 use down `left_output` with sequential down calibration stats.
+  - Sequential down calibration for D5-D7 first quantizes gate/up, then collects
+    down moments and down output covariance from
+    `activation(gate_Q) * up_Q` with FP down outputs.
   - Adds `kaggle_commands.md` with copy-paste Kaggle control-plane, dry-run,
-    full ablation, and pilot cells.
+    full ablation, pilot, NMSE annotation, and Down V2 time-to-insight cells.
   - Adds `tests/test_qwen36_single_layer_ablation.py` for local coverage of the
     layer-local runner helpers.
 
@@ -217,6 +234,22 @@ This is still a research/plumbing prototype:
     not pretrained-model quality evidence.
   - Does not add the local `readme_draft.md` or
     `lambda_grant_application_draft.md` drafts to git.
+
+- Down Projection V2 local implementation:
+  - Adds `SharedOutputDecomposition` and `decompose_shared_output_subspace(...)`
+    for down `left_output` mode.
+  - Extends storage accounting for `shared_mode` values `right_input`,
+    `left_output`, and `none`.
+  - Extends official-Qwen RCQ linears and artifact state to support
+    `shared_mode="none"` and `shared_mode="left_output"`.
+  - Extends `LinearCalibrationStats` with optional per-expert moments,
+    selected-count shrinkage state, global fallback moments, router-weight
+    sums, and down output covariance.
+  - Adds local tests for down min-2 configs, per-expert moment handling,
+    cold-expert shrinkage, left-output decomposition, official conversion,
+    artifact round-trip, and layer-local D-row construction.
+  - No pretrained Down V2 quality claim has been made yet; the D0/D3/D4/D5/D6
+    Kaggle run is the next evidence slice.
 
 ## Generated Local Data
 
@@ -312,7 +345,24 @@ uv run pytest -q
 Latest result:
 
 ```text
-68 passed
+81 passed
+```
+
+Latest Down Projection V2 local implementation slice:
+
+```text
+Implemented down mode none and left_output locally, including D0-D7 row
+construction for the layer-local Qwen3.6 runner and Section 9 Kaggle commands
+for a D0/D3/D4/D5/D6 time-to-insight run. Full local tests pass. No pretrained
+Down V2 ablation has been run yet.
+```
+
+Latest GitHub push for Kaggle Down V2:
+
+```text
+origin/main=dc4f3b097369b22284bc48f2b56a29d2e6b2dbe2
+Pinned Down V2 implementation commit for Kaggle:
+65d1ebf867a38257412d1a6b8efd7a9856d70014
 ```
 
 Latest remote-worker focused test command:
@@ -573,6 +623,10 @@ python3 scripts/build_text_fixture.py \
 ## Recent Commits Before This State Update
 
 ```text
+dc4f3b0 Add Kaggle Down V2 pilot commands
+65d1ebf Add down left-output projection path
+bea155b Add down projection min2 no-shared path
+f4490a2 Record Kaggle pilot NMSE results
 e29b008 Add NMSE reporting for Qwen layer ablations
 1a4d5ea Record Kaggle T4 Qwen layer pilot
 f68645f Resume completed ablation rows
@@ -604,6 +658,8 @@ e872141 Add streamed text fixture builder
 - No full pretrained Qwen/MoE checkpoint has been quantized.
 - There is now a pretrained Qwen3.6 layer-local RCQ pilot for layer 0 on
   Kaggle T4 x2, but no full-model pretrained quality evaluation yet.
+- Down Projection V2 is implemented and locally tested, but the real Qwen3.6
+  D0/D3/D4/D5/D6 ablation has not yet been run on Kaggle/remote GPU.
 - The API-pushed competition-attached Kaggle notebook selected P100 rather than
   RTX PRO 6000, so it is not the desired validation path for Slice 3.
 - The manually created RTX PRO 6000 Kaggle notebook currently has internet
@@ -625,8 +681,9 @@ e872141 Add streamed text fixture builder
 Continue the pretrained-compatible validation path slice by slice:
 
 1. Extend the Kaggle T4 x2 layer-local pilot.
-   - Run the rank and router-aware/unweighted covariance rows using the same
-     true layer-0 activation path.
+   - Run `kaggle_commands.md` Section 9 against the pushed Down V2 commit to
+     compare D0, D3, D4, D5, and D6 on the same true layer-0 activation path.
+   - Add D7 if runtime permits after the first D-row readout.
    - Add compact doc hashes/lengths for the streamed 40-document pilot set.
    - Consider a larger 256/64/4096 evidence run if runtime remains acceptable.
    - Still report this as layer-local routed MoE-output MSE, not full-model KL.
