@@ -13,8 +13,10 @@ JSON job specs. The active pretrained-compatible validation plan is now moving
 from Kaggle to a single AMD MI300X remote host with SSH, exact git commit
 checkout, remote-only model caches, and small local result pulls. The FP smoke
 script now records ROCm-aware runtime metadata needed for the first MI300X
-control-plane dry-run. The repository now has a public-facing `README.MD`
-copied from the current README draft.
+control-plane dry-run. A Kaggle T4 x2 fallback has now produced a first
+pretrained, layer-local Qwen3.6 RCQ pilot on true layer-0 MoE inputs. The
+repository now has a public-facing `README.MD` copied from the current README
+draft.
 
 This is still a research/plumbing prototype:
 
@@ -187,6 +189,25 @@ This is still a research/plumbing prototype:
     `nvidia-smi` informational on ROCm-only hosts.
   - Adds test coverage through the local `control_plane_smoke` dry-run action.
 
+- Kaggle T4 x2 single-layer Qwen3.6 RCQ pilot:
+  - Adds `scripts/qwen36_single_layer_rcq_ablation.py`, a constrained
+    pretrained layer-local runner for `Qwen/Qwen3.6-35B-A3B`.
+  - Uses official Transformers Qwen3.5-MoE layer code on Kaggle
+    `transformers==5.9.0` to run the true layer-0 token mixer:
+    embeddings -> layer-0 input RMSNorm -> official layer-0 linear attention
+    -> residual add -> post-attention RMSNorm -> layer-0 MoE/router.
+  - Loads only tokenizer, embedding tensor, and the selected decoder layer
+    shards from the Hugging Face cache; it does not load the full model.
+  - Streams raw FineWeb-Edu text from Hugging Face on Kaggle, with no text
+    cleanup/normalization/deduplication beyond tokenizer truncation.
+  - Caches true MoE inputs, router decisions/weights, and FP routed MoE outputs
+    once, then reuses them across ablations.
+  - Supports partial-result resume via `--skip-completed-from`.
+  - Adds `kaggle_commands.md` with copy-paste Kaggle control-plane, dry-run,
+    full ablation, and pilot cells.
+  - Adds `tests/test_qwen36_single_layer_ablation.py` for local coverage of the
+    layer-local runner helpers.
+
 - Public README:
   - Adds `README.MD`, synced from `readme_draft.md`.
   - Summarizes RCQ-MoE motivation, research goals, compression recipe,
@@ -291,7 +312,7 @@ uv run pytest -q
 Latest result:
 
 ```text
-63 passed
+67 passed
 ```
 
 Latest remote-worker focused test command:
@@ -354,6 +375,60 @@ Patched scripts/qwen36_fp_smoke.py to record ROCm-aware runtime metadata for
 MI300X dry-runs while preserving CUDA/local CPU compatibility. The local dry-run
 completed without loading pretrained model weights. No SSH command was run and
 no remote access was used.
+```
+
+Latest Kaggle T4 x2 single-layer Qwen3.6 RCQ pilot:
+
+```text
+Environment: Kaggle 2 x Tesla T4, Python 3.12.12, torch 2.10.0+cu128,
+transformers 5.9.0.
+Source commit used by runner: latest main through the Kaggle command cell.
+Model: Qwen/Qwen3.6-35B-A3B.
+Layer: 0, layer_type=linear_attention.
+Activation source: true_layer0_post_attention_norm.
+Path: embed_tokens -> layer0 input RMSNorm -> layer0 attention -> residual add
+-> post-attention RMSNorm.
+Data: raw HuggingFaceFW/fineweb-edu train stream.
+Calibration: first 32 streamed docs.
+Held-out eval: next 8 streamed docs.
+Max tokens per doc: 1024.
+Text postprocessing: none; raw dataset text is passed directly to tokenizer
+with truncation only.
+Elapsed: 1987.6756 sec.
+```
+
+Latest Kaggle T4 x2 pilot held-out routed MoE-output MSE/RMSE:
+
+```text
+baseline_fp_layer_local: mse=0, rmse=0
+A0 shared + naive 1-bit residual, no Hadamard/rescue/correction:
+  mse=0.0050930439, rmse=0.0713655649
+A1 A0 + Hadamard:
+  mse=0.0046207301, rmse=0.0679759525
+A2 A1 + activation-weighted binary scale:
+  mse=0.0046217143, rmse=0.0679831910
+A3 A2 + rcq_1p55 rescue:
+  mse=0.0037782405, rmse=0.0614673935
+A3 A2 + rcq_1p75 rescue:
+  mse=0.0031429059, rmse=0.0560616255
+A3 A2 + rcq_1p90 rescue:
+  mse=0.0026224348, rmse=0.0512097136
+A4 rcq_1p55 + routed MoE-output correction:
+  mse=0.0037350447, rmse=0.0611150119
+A4 rcq_1p75 + routed MoE-output correction:
+  mse=0.0031083712, rmse=0.0557527684
+A4 rcq_1p90 + routed MoE-output correction:
+  mse=0.0025962735, rmse=0.0509536408
+```
+
+Interpretation:
+
+```text
+This is the first pretrained Qwen3.6 RCQ evidence, but it is layer-local only.
+It is not full-model KL, PPL, or downstream quality. It shows the expected
+directional pattern on true layer-0 MoE inputs: Hadamard improves over naive
+1-bit; mixed-bit rescue gives the largest improvement; routed correction gives
+a small additional held-out improvement for each rescue setting.
 ```
 
 Latest text-token smoke command:
@@ -449,6 +524,13 @@ python3 scripts/build_text_fixture.py \
 ## Recent Commits Before This State Update
 
 ```text
+f68645f Resume completed ablation rows
+fcc479d Cache single-layer ablation inputs
+24b5be0 Add verbose Kaggle ablation progress logs
+1216480 Use official Qwen layer for single-layer calibration
+02338c0 Avoid AutoConfig for Qwen single-layer inspector
+d951986 Add Kaggle single-layer Qwen RCQ ablation runner
+70dd76c Add ROCm-aware Qwen FP smoke metadata
 fa9d25e Record GitHub repo rename
 81a0599 Resync public README
 790d488 Add public README
@@ -468,9 +550,9 @@ e872141 Add streamed text fixture builder
 
 ## Current Limitations
 
-- No real pretrained Qwen/MoE checkpoint has been quantized.
-- No pretrained-model quality evaluation yet; slice 2 uses the real
-  `Qwen/Qwen3.6-35B-A3B` tokenizer with a tiny random official Qwen-shaped model.
+- No full pretrained Qwen/MoE checkpoint has been quantized.
+- There is now a pretrained Qwen3.6 layer-local RCQ pilot for layer 0 on
+  Kaggle T4 x2, but no full-model pretrained quality evaluation yet.
 - The API-pushed competition-attached Kaggle notebook selected P100 rather than
   RTX PRO 6000, so it is not the desired validation path for Slice 3.
 - The manually created RTX PRO 6000 Kaggle notebook currently has internet
@@ -478,7 +560,8 @@ e872141 Add streamed text fixture builder
 - The MI300X path is designed and the FP smoke script is ROCm-metadata-ready,
   but it has not yet been executed over SSH; no SSH alias, remote PyTorch/ROCm
   metadata, or remote dry-run output has been recorded yet.
-- No completed Kaggle Qwen3.6 FP smoke outputs have been pulled or interpreted.
+- No completed full-model Kaggle Qwen3.6 FP smoke outputs have been pulled or
+  interpreted.
 - Current artifact stores fake-dequant reference tensors, not packed bitstreams.
 - No FP8 scale/shared-factor storage.
 - No fused kernels or performance benchmarks.
@@ -488,22 +571,28 @@ e872141 Add streamed text fixture builder
 
 ## Recommended Next Milestone
 
-Continue the pretrained-compatible MI300X path slice by slice:
+Continue the pretrained-compatible validation path slice by slice:
 
-1. MI300X control-plane smoke.
+1. Extend the Kaggle T4 x2 layer-local pilot.
+   - Run the rank and router-aware/unweighted covariance rows using the same
+     true layer-0 activation path.
+   - Add compact doc hashes/lengths for the streamed 40-document pilot set.
+   - Consider a larger 256/64/4096 evidence run if runtime remains acceptable.
+   - Still report this as layer-local routed MoE-output MSE, not full-model KL.
+2. MI300X control-plane smoke when MI300X capacity is available.
    - Use SSH to run `scripts/qwen36_fp_smoke.py --dry-run` from an exact pinned
      commit on the MI300X host.
    - Verify PyTorch, ROCm, GPU visibility, repo checkout, imports, and small
      output writing.
    - Do not load Qwen weights in this slice.
-2. MI300X Qwen3.6 FP-only smoke.
+3. MI300X Qwen3.6 FP-only smoke.
    - Load `Qwen/Qwen3.6-35B-A3B` on MI300X, not locally.
    - Use the remote Hugging Face cache under the MI300X workspace.
    - Run tokenizer-driven FP-only eval and inspect/capture sparse MoE block
      structure under the remote output directory.
    - Pull only compact JSON/text/log outputs back to local.
    - Do not quantize in this slice.
-3. One-layer pretrained RCQ conversion.
+4. One-layer pretrained RCQ conversion in a full-model context.
    - Add layer-limited conversion if needed.
    - Quantize exactly one Qwen3.6 MoE layer/block first on MI300X.
    - Report FP-vs-one-layer-RCQ KL, routed MoE MSE before/after correction,

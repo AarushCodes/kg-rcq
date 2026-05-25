@@ -23,6 +23,7 @@ artifacts, not source files to modify.
 ├── pyproject.toml
 ├── state.md
 ├── uv.lock
+├── kaggle_commands.md
 ├── docs/
 │   └── specs/
 │       ├── 2026-05-24-kaggle-remote-control-design.md
@@ -50,6 +51,7 @@ artifacts, not source files to modify.
 │   ├── official_qwen_toy_ablation.py
 │   ├── official_qwen_toy_artifact.py
 │   ├── official_qwen_toy_kl.py
+│   ├── qwen36_single_layer_rcq_ablation.py
 │   └── qwen36_fp_smoke.py
 ├── kaggle/
 │   ├── remote_worker/
@@ -76,6 +78,7 @@ artifacts, not source files to modify.
     ├── test_official_qwen_text_harness.py
     ├── test_rcq_decomposition.py
     ├── test_rcq_math.py
+    ├── test_qwen36_single_layer_ablation.py
     ├── test_remote_jobs.py
     ├── test_text_data.py
     ├── test_tiny_qwen_normal.py
@@ -149,6 +152,26 @@ milestone.
 ### `uv.lock`
 
 Tracked environment lockfile for reproducible local setup.
+
+### `kaggle_commands.md`
+
+Copy-paste Kaggle notebook command cells for the active T4 x2 fallback path.
+
+Contains:
+
+- Control-plane smoke cell for Kaggle GPU visibility, exact GitHub commit
+  checkout, dependency version reporting, and `scripts/qwen36_fp_smoke.py`
+  dry-run metadata.
+- Single-layer Qwen3.6 RCQ ablation dry-run cell that inspects config,
+  safetensors index key matching, required shards, and layer type before
+  loading tensor shards.
+- Full and pilot single-layer ablation cells for Kaggle.
+- A normal Python-cell variant for Kaggle sessions that buffer `%%bash` output.
+- Result-bundle packaging instructions that include only compact JSON/log files,
+  not model shards or Hugging Face cache contents.
+
+Use this as the manual remote-control surface while the Kaggle backend remains a
+notebook-driven fallback rather than the original one-shot worker path.
 
 ## `docs/`
 
@@ -591,6 +614,44 @@ Contains:
 Use this for the first real Qwen3.6 slice. It deliberately does not quantize or
 save model weights.
 
+### `scripts/qwen36_single_layer_rcq_ablation.py`
+
+Layer-local pretrained Qwen3.6 RCQ ablation runner for constrained Kaggle T4 x2
+experiments.
+
+Contains:
+
+- CLI args for model ID, layer ID, FineWeb-Edu streaming split, calibration/eval
+  document counts, max tokens per doc, block size, output/cache directories,
+  activation source, verbose logging, max experiment count, and partial-result
+  resume.
+- Dry-run mode that inspects `config.json`, official Transformers
+  Qwen3.5-MoE layer state keys, safetensors index key matching, required shard
+  names, layer type schedule, and required tensor availability without loading
+  tensor shards.
+- Official Transformers `Qwen3_5MoeDecoderLayer` loading for the selected layer,
+  including Qwen hybrid `linear_attention` on layer 0.
+- True layer-0 MoE input construction:
+  embeddings -> layer-0 input RMSNorm -> official layer-0 token mixer ->
+  residual add -> post-attention RMSNorm.
+- Remote-only loading of tokenizer, embedding tensor, and selected layer tensor
+  shards from the Hugging Face cache; the full model is not loaded.
+- Raw FineWeb-Edu streaming with first-N calibration and next-N held-out docs;
+  no text cleanup/normalization/deduplication beyond tokenizer truncation.
+- Cached true MoE inputs, router decisions/weights, and FP routed MoE outputs
+  reused across ablation rows.
+- Router-weighted stats by default, lazy unweighted stats only when a selected
+  experiment needs the router-aware comparison.
+- Layer-local ablations for A0/A1/A2, rescue configs `rcq_1p55`,
+  `rcq_1p75`, `rcq_1p90`, routed MoE-output correction, rank variants, and
+  explicit `not_available` markers for unavailable production/2-bit/KBVQ and
+  grouped-subspace baselines.
+- Compact outputs: `run_manifest.json`, `index_summary.json`,
+  `ablation_metrics.partial.json`, and `ablation_metrics.json`.
+
+Use this for pretrained layer-local routed MoE-output MSE evidence only. It
+does not report full-model KL, PPL, or downstream task quality.
+
 ## `kaggle/`
 
 Kaggle script/notebook definitions used as remote GPU runners. These files
@@ -802,6 +863,19 @@ Covers:
 - Rescue block selection percentages for `rcq_1p75`.
 - Dequantized residual shapes.
 - Storage bpw accounting.
+
+### `tests/test_qwen36_single_layer_ablation.py`
+
+Tests local helpers for the constrained Qwen3.6 single-layer RCQ ablation
+runner.
+
+Covers:
+
+- Rank divisor behavior for small and non-divisible dimensions.
+- Dict-style config helper behavior so dry-run inspection does not require
+  model registration when reading raw `config.json`.
+- Tiny-weight execution of the proxy debug path.
+- Tiny-weight execution of the true layer-0 attention activation path.
 
 ### `tests/test_remote_jobs.py`
 
