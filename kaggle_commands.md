@@ -478,6 +478,10 @@ PY""",
 )
 
 runner_log = RCQ_LOG_DIR / "qwen36_single_layer_rcq_pilot.runner.log"
+resume_file = RCQ_OUT / "ablation_metrics.partial.json"
+resume_arg = f" --skip-completed-from {resume_file}" if resume_file.exists() else ""
+if resume_arg:
+    print(f"=== resume from {resume_file} ===", flush=True)
 cmd = f"""
 PYTHONUNBUFFERED=1 PYTHONPATH={RCQ_ROOT} python -u scripts/qwen36_single_layer_rcq_ablation.py \
   --model-id Qwen/Qwen3.6-35B-A3B \
@@ -489,7 +493,8 @@ PYTHONUNBUFFERED=1 PYTHONPATH={RCQ_ROOT} python -u scripts/qwen36_single_layer_r
   --max-experiments 13 \
   --verbose \
   --output-dir {RCQ_OUT} \
-  --cache-dir {HF_HOME}
+  --cache-dir {HF_HOME} \
+  {resume_arg}
 """
 
 print("=== run pilot ablations ===", flush=True)

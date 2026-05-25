@@ -209,6 +209,27 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _load_resume_results(path: Path | None) -> list[dict[str, Any]]:
+    if path is None:
+        return []
+    if not path.exists():
+        raise FileNotFoundError(f"resume file does not exist: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    rows = payload.get("results")
+    if not isinstance(rows, list):
+        raise ValueError(f"resume file has no results list: {path}")
+    valid: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if not isinstance(row.get("label"), str):
+            continue
+        if row.get("status") not in {"ok", "not_available"}:
+            continue
+        valid.append(row)
+    return valid
+
+
 def _text_config(config: Any) -> Any:
     if isinstance(config, dict):
         return config.get("text_config", config)
@@ -1487,6 +1508,11 @@ def main() -> None:
     )
     parser.add_argument("--verbose", action="store_true", help="Print timestamped progress logs for Kaggle notebooks.")
     parser.add_argument("--max-experiments", type=int, help="Run only the first N ablation experiments.")
+    parser.add_argument(
+        "--skip-completed-from",
+        type=Path,
+        help="Read a previous partial/final metrics JSON and skip rows already completed with matching labels.",
+    )
     args = parser.parse_args()
 
     global VERBOSE
@@ -1522,6 +1548,7 @@ def main() -> None:
             else "embed_tokens + selected_layer.post_attention_layernorm; attention/prefix layers not executed"
         ),
         "include_shared_expert": args.include_shared_expert,
+        "skip_completed_from": str(args.skip_completed_from) if args.skip_completed_from is not None else None,
         "secret_env_present": {
             "HF_TOKEN": bool(os.environ.get("HF_TOKEN")),
             "HUGGING_FACE_HUB_TOKEN": bool(os.environ.get("HUGGING_FACE_HUB_TOKEN")),
@@ -1627,6 +1654,16 @@ def main() -> None:
     if args.max_experiments is not None:
         experiments = experiments[: args.max_experiments]
 
+    resumed_results = _load_resume_results(args.skip_completed_from)
+    resumed_by_label = {row["label"]: row for row in resumed_results}
+    if resumed_by_label:
+        experiment_labels = {label for label, _ in experiments}
+        ignored = sorted(set(resumed_by_label) - experiment_labels)
+        if ignored:
+            _log(f"resume ignored labels not in selected experiment set: {ignored}", force=True)
+        resumed_by_label = {label: row for label, row in resumed_by_label.items() if label in experiment_labels}
+        _log(f"resume loaded completed labels: {sorted(resumed_by_label)}", force=True)
+
     stats_cache: dict[str, dict[str, LinearCalibrationStats]] = {}
 
     def get_stats(kind: str) -> dict[str, LinearCalibrationStats]:
@@ -1642,6 +1679,10 @@ def main() -> None:
 
     results: list[dict[str, Any]] = []
     for label, spec in experiments:
+        if label in resumed_by_label:
+            _log(f"resume skip completed label={label}", force=True)
+            results.append(resumed_by_label[label])
+            continue
         if spec is None:
             calib = evaluate_cached_batches(
                 calib_batches,
