@@ -259,6 +259,7 @@ Generated and intentionally ignored by git:
 data/text_fixtures/generated/fineweb_edu_256_calib.txt  347K
 data/text_fixtures/generated/fineweb_edu_256_eval.txt    80K
 outputs/qwen36_fp_smoke_dry_run/
+runs/run2/  # Kaggle Down V2 compact run outputs; ignored by git
 ```
 
 Generation command:
@@ -353,8 +354,7 @@ Latest Down Projection V2 local implementation slice:
 ```text
 Implemented down mode none and left_output locally, including D0-D7 row
 construction for the layer-local Qwen3.6 runner and Section 9 Kaggle commands
-for a D0/D3/D4/D5/D6 time-to-insight run. Full local tests pass. No pretrained
-Down V2 ablation has been run yet.
+for a D0/D3/D4/D5/D6 time-to-insight run. Full local tests pass.
 ```
 
 Latest GitHub push for Kaggle Down V2:
@@ -363,6 +363,89 @@ Latest GitHub push for Kaggle Down V2:
 origin/main=dc4f3b097369b22284bc48f2b56a29d2e6b2dbe2
 Pinned Down V2 implementation commit for Kaggle:
 65d1ebf867a38257412d1a6b8efd7a9856d70014
+```
+
+Latest Kaggle T4 x2 Down Projection V2 pilot:
+
+```text
+Output location: runs/run2.
+Command path: kaggle_commands.md Section 9.
+Runner status: ok.
+Model: Qwen/Qwen3.6-35B-A3B.
+Layer: 0.
+Activation source: true_layer0_post_attention_norm.
+Data policy: same 32 calibration docs / 8 held-out docs / 1024 max tokens per
+doc policy as the prior layer-local pilot.
+Held-out FP reference variance shown in pasted summary:
+  0.007117566059033092.
+
+D0_current_baseline_legacy_right_rcq_1p75_correction:
+  average_expert_bpw=1.7575926781
+  gate_bpw=1.7582030296, up_bpw=1.7582030296, down_bpw=1.7563719749
+  heldout_mse=0.0031083712
+  heldout_nmse_mean_square=0.4367076224
+  down_mode=right_input, down_cfg=rcq_1p75
+  down_legacy_right_captured_energy=0.0409812603
+  down_widths={1: 0.75, 2: 0.2000000477, 4: 0.0499999523}
+
+D3_gate_up_1p55_down_none_min2_5p4_correction:
+  row appears to have been run, but the pasted compact summary omitted the
+  label/MSE/bpw prefix. Only the down widths were visible:
+  down_widths={1: 0.0, 2: 0.9500000477, 4: 0.0499999523}.
+  Inspect runs/run2/ablation_metrics.json before drawing conclusions about D3.
+
+D4_gate_up_1p55_down_none_min2_20p4_correction:
+  average_expert_bpw=1.9392186801
+  gate_bpw=1.5682029724, up_bpw=1.5682029724, down_bpw=2.6812500954
+  heldout_mse=0.0026753739
+  heldout_nmse_mean_square=0.3758740844
+  down_mode=none, down_cfg=down_min2_20p4
+  down_widths={1: 0.0, 2: 0.7999999523, 4: 0.2000000477}
+
+D5_gate_up_1p55_down_left_output_mix_1bit:
+  average_expert_bpw=1.5997980436
+  gate_bpw=1.5682029724, up_bpw=1.5682029724, down_bpw=1.6629881859
+  heldout_mse=0.0029326434
+  heldout_nmse_mean_square=0.4120189131
+  down_mode=left_output, down_cfg=down_mix_1bit
+  down_left_output_captured_energy=0.0680184296
+  down_widths={1: 0.75, 2: 0.2000000477, 4: 0.0499999523}
+
+D6_gate_up_1p55_down_left_output_min2_5p4:
+  average_expert_bpw=1.8497980436
+  gate_bpw=1.5682029724, up_bpw=1.5682029724, down_bpw=2.4129881859
+  heldout_mse=0.0027842524
+  heldout_nmse_mean_square=0.3911708661
+  down_mode=left_output, down_cfg=down_min2_5p4
+  down_left_output_captured_energy=0.0680184296
+  down_widths={1: 0.0, 2: 0.9500000477, 4: 0.0499999523}
+
+D7_gate_up_1p75_down_left_output_min2_20p4:
+  status=not_available
+  reason=intentionally skipped by Section 9 time-to-insight Down V2 cell.
+```
+
+Interpretation of the pasted Down V2 summary:
+
+```text
+D6 is the best recorded <=1.90 average-bpw row in the pasted summary:
+  heldout_nmse=0.3911708661 at average_expert_bpw=1.8497980436.
+  Relative improvement vs D0 is about 10.4%.
+
+D4 has the lowest pasted NMSE:
+  heldout_nmse=0.3758740844,
+  but average_expert_bpw=1.9392186801 exceeds the <=1.90 target.
+
+D5 is lower bpw than D0 but only modestly improves NMSE:
+  heldout_nmse=0.4120189131 at average_expert_bpw=1.5997980436.
+
+Neither pasted <=1.90-bpw row reaches the Down V2 minimum success criterion
+of heldout NMSE <=0.33. The new left-output down subspace captures about
+6.8% routed down-output energy, better than the old 4.1% legacy-right
+captured-energy diagnostic, but still small.
+
+These are layer-local routed MoE-output NMSE results only, not full-model KL,
+PPL, or downstream quality.
 ```
 
 Latest remote-worker focused test command:
@@ -658,8 +741,10 @@ e872141 Add streamed text fixture builder
 - No full pretrained Qwen/MoE checkpoint has been quantized.
 - There is now a pretrained Qwen3.6 layer-local RCQ pilot for layer 0 on
   Kaggle T4 x2, but no full-model pretrained quality evaluation yet.
-- Down Projection V2 is implemented and locally tested, but the real Qwen3.6
-  D0/D3/D4/D5/D6 ablation has not yet been run on Kaggle/remote GPU.
+- Down Projection V2 has a first Kaggle T4 x2 layer-local run in `runs/run2`,
+  but the pasted <=1.90-bpw rows have not reached held-out NMSE <=0.33.
+  D3 should be verified from the JSON because its compact pasted line was
+  incomplete.
 - The API-pushed competition-attached Kaggle notebook selected P100 rather than
   RTX PRO 6000, so it is not the desired validation path for Slice 3.
 - The manually created RTX PRO 6000 Kaggle notebook currently has internet
@@ -681,9 +766,12 @@ e872141 Add streamed text fixture builder
 Continue the pretrained-compatible validation path slice by slice:
 
 1. Extend the Kaggle T4 x2 layer-local pilot.
-   - Run `kaggle_commands.md` Section 9 against the pushed Down V2 commit to
-     compare D0, D3, D4, D5, and D6 on the same true layer-0 activation path.
-   - Add D7 if runtime permits after the first D-row readout.
+   - Inspect the compact JSON in `runs/run2` to recover the full D3 row and
+     verify the pasted D0/D4/D5/D6 metrics.
+   - Run D7 if runtime permits, since the current Section 9 pilot skipped it.
+   - If D3/D6 do not reach held-out NMSE <=0.33 at <=1.90 average bpw, proceed
+     to a neuron-alignment research slice rather than adding more left-output
+     shared overhead.
    - Add compact doc hashes/lengths for the streamed 40-document pilot set.
    - Consider a larger 256/64/4096 evidence run if runtime remains acceptable.
    - Still report this as layer-local routed MoE-output MSE, not full-model KL.
