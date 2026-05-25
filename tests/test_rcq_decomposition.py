@@ -1,6 +1,6 @@
 import torch
 
-from rcq_moe.decomposition import choose_rank, decompose_shared_subspace, klt_transform
+from rcq_moe.decomposition import choose_rank, decompose_shared_output_subspace, decompose_shared_subspace, klt_transform
 
 
 def test_choose_rank_follows_spec_but_caps_to_tiny_dimension():
@@ -46,3 +46,38 @@ def test_full_rank_shared_decomposition_has_near_zero_residual():
         assert residual.norm().item() < 1e-10
     assert decomp.captured_energy > 0.999999
 
+
+def test_left_output_decomposition_full_rank_reconstructs_weight():
+    torch.manual_seed(4)
+    weights = [torch.randn(5, 7, dtype=torch.float64) for _ in range(3)]
+    output_covariance = torch.randn(5, 5, dtype=torch.float64)
+    output_covariance = output_covariance @ output_covariance.T
+
+    decomp = decompose_shared_output_subspace(weights, output_covariance, rank=5)
+
+    assert decomp.u_shared.shape == (5, 5)
+    assert torch.allclose(decomp.u_shared.T @ decomp.u_shared, torch.eye(5, dtype=torch.float64), atol=1e-8)
+    for weight, c_factor, residual in zip(weights, decomp.c_factors, decomp.residuals):
+        assert c_factor.shape == (5, 7)
+        assert torch.allclose(decomp.u_shared @ c_factor + residual, weight, atol=1e-10)
+        assert residual.norm().item() < 1e-10
+
+
+def test_left_output_decomposition_low_rank_shapes_and_rejects_rank_zero():
+    torch.manual_seed(5)
+    weights = [torch.randn(6, 4) for _ in range(2)]
+    output_covariance = torch.eye(6)
+
+    decomp = decompose_shared_output_subspace(weights, output_covariance, rank=3)
+
+    assert decomp.u_shared.shape == (6, 3)
+    assert len(decomp.c_factors) == 2
+    assert decomp.c_factors[0].shape == (3, 4)
+    assert decomp.residuals[0].shape == (6, 4)
+    assert 0.0 <= decomp.captured_energy <= 1.0
+    try:
+        decompose_shared_output_subspace(weights, output_covariance, rank=0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("rank 0 should be rejected for left_output")

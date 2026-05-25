@@ -11,6 +11,7 @@ from scripts.qwen36_single_layer_rcq_ablation import (
     _down_v2_experiments,
     _fp_output_stats,
     build_q_moe,
+    collect_sequential_down_stats_from_cache,
     evaluate_docs,
     _getattr_any,
     _rank_for_divisor,
@@ -33,6 +34,7 @@ def _stats(num_experts: int, input_dim: int, rows: int, block_size: int) -> Line
         covariance=torch.eye(input_dim),
         expert_importance=torch.full((num_experts,), 1.0 / num_experts),
         rotated_second_moments=torch.ones(blocks, block_size),
+        down_output_covariance=torch.eye(rows),
     )
 
 
@@ -151,7 +153,9 @@ def test_down_v2_experiment_rows_and_none_mode_bpw_fields() -> None:
     assert rows["D3_gate_up_1p55_down_none_min2_5p4_correction"]["down_shared_mode"] == "none"
     assert rows["D3_gate_up_1p55_down_none_min2_5p4_correction"]["down_moment_mode"] == "per_expert"
     assert rows["D3_gate_up_1p55_down_none_min2_5p4_correction"]["down_rescue_config"].name == "down_min2_5p4"
-    assert isinstance(rows["D7_gate_up_1p75_down_left_output_min2_20p4"], str)
+    assert rows["D5_gate_up_1p55_down_left_output_mix_1bit"]["down_shared_mode"] == "left_output"
+    assert rows["D5_gate_up_1p55_down_left_output_mix_1bit"]["down_sequential_stats"] is True
+    assert rows["D7_gate_up_1p75_down_left_output_min2_20p4"]["down_rescue_config"].name == "down_min2_20p4"
 
 
 def test_build_q_moe_down_none_uses_min2_widths() -> None:
@@ -218,6 +222,92 @@ def test_build_q_moe_down_none_uses_min2_widths() -> None:
     assert q_moe.down.decomposition.b_shared.shape[0] == 0
     assert int((q_moe.down.widths == 1).sum()) == 0
     assert q_moe.down.bpw > 0.0
+
+
+def test_build_q_moe_down_left_output_uses_output_decomposition() -> None:
+    torch.manual_seed(3)
+    num_experts = 2
+    hidden = 8
+    intermediate = 6
+    block = 4
+    layer = LoadedLayer(
+        embed_tokens=torch.randn(16, hidden),
+        input_norm_weight=torch.zeros(hidden),
+        post_attention_norm_weight=torch.zeros(hidden),
+        q_proj_weight=torch.randn(2 * hidden, hidden),
+        q_proj_bias=None,
+        k_proj_weight=torch.randn(hidden, hidden),
+        k_proj_bias=None,
+        v_proj_weight=torch.randn(hidden, hidden),
+        v_proj_bias=None,
+        o_proj_weight=torch.randn(hidden, hidden),
+        o_proj_bias=None,
+        q_norm_weight=torch.zeros(hidden),
+        k_norm_weight=torch.zeros(hidden),
+        router_weight=torch.randn(num_experts, hidden),
+        gate_weight=torch.randn(num_experts, intermediate, hidden),
+        up_weight=torch.randn(num_experts, intermediate, hidden),
+        down_weight=torch.randn(num_experts, hidden, intermediate),
+        shared_gate_weight=torch.randn(intermediate, hidden),
+        shared_up_weight=torch.randn(intermediate, hidden),
+        shared_down_weight=torch.randn(hidden, intermediate),
+        shared_expert_gate_weight=torch.randn(1, hidden),
+        hidden_act="silu",
+        rms_norm_eps=1e-6,
+        layer_type="full_attention",
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=hidden,
+        attention_bias=False,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 1.0},
+        top_k=1,
+    )
+    down_stats = _stats(num_experts, intermediate, hidden, block)
+    down_stats.per_expert_rotated_second_moments = torch.ones(num_experts, (intermediate + block - 1) // block, block)
+    stats = {
+        "gate": _stats(num_experts, hidden, intermediate, block),
+        "up": _stats(num_experts, hidden, intermediate, block),
+        "down": down_stats,
+    }
+
+    q_moe = build_q_moe(
+        layer,
+        stats,
+        rank_divisor=256,
+        use_hadamard=True,
+        weighted_scale=True,
+        rescue_config=None,
+        down_rescue_config=RescueConfig.down_mix_1bit(block),
+        down_shared_mode="left_output",
+        down_moment_mode="per_expert",
+    )
+
+    assert q_moe.down.shared_mode == "left_output"
+    assert q_moe.down.output_decomposition is not None
+    assert q_moe.down.output_decomposition.u_shared.shape == (hidden, 1)
+    assert q_moe.down.weight_for_expert(0).shape == (hidden, intermediate)
+
+    batches = [
+        CachedBatch(
+            hidden=torch.randn(3, hidden),
+            router_weights=torch.ones(3, 1),
+            selected_experts=torch.tensor([[0], [1], [0]]),
+            fp_output=torch.zeros(3, hidden),
+        )
+    ]
+    sequential = collect_sequential_down_stats_from_cache(
+        batches,
+        layer,
+        q_moe.gate,
+        q_moe.up,
+        block_size=block,
+        device=torch.device("cpu"),
+        weighted=True,
+    )
+    assert sequential.down_output_covariance is not None
+    assert sequential.down_output_covariance.shape == (hidden, hidden)
+    assert sequential.per_expert_rotated_second_moments is not None
+    assert torch.isfinite(sequential.per_expert_rotated_second_moments).all()
 
 
 def test_true_layer0_attention_activation_path_runs_on_tiny_weights() -> None:

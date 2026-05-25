@@ -21,12 +21,20 @@ def _linear_set_to_state(linear: OfficialQwen35RCQLinearSet, prefix: str) -> dic
     state: dict[str, torch.Tensor | int | float | str] = {
         f"{prefix}.num_experts": len(linear.q_residuals),
         f"{prefix}.shared_mode": linear.shared_mode,
+        f"{prefix}.residual_config": linear.residual_config or "",
+        f"{prefix}.moment_mode": linear.moment_mode,
         f"{prefix}.b_shared": linear.decomposition.b_shared.detach().cpu(),
         f"{prefix}.eigvals": linear.decomposition.eigvals.detach().cpu(),
         f"{prefix}.eigvecs": linear.decomposition.eigvecs.detach().cpu(),
         f"{prefix}.v_r": linear.decomposition.v_r.detach().cpu(),
         f"{prefix}.captured_energy": float(linear.decomposition.captured_energy),
     }
+    if linear.output_decomposition is not None:
+        state[f"{prefix}.u_shared"] = linear.output_decomposition.u_shared.detach().cpu()
+        state[f"{prefix}.output_eigvals"] = linear.output_decomposition.eigvals.detach().cpu()
+        state[f"{prefix}.output_eigvecs"] = linear.output_decomposition.eigvecs.detach().cpu()
+        for expert_id, c_factor in enumerate(linear.output_decomposition.c_factors):
+            state[f"{prefix}.c{expert_id}"] = c_factor.detach().cpu()
     for expert_id, a_factor in enumerate(linear.decomposition.a_factors):
         state[f"{prefix}.a{expert_id}"] = a_factor.detach().cpu()
     for expert_id, q in enumerate(linear.q_residuals):

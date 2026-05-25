@@ -3,7 +3,7 @@
 from .codebooks import lloyd_max_codebook
 from .correction import OnlineChannelRegression
 from .artifact import load_official_qwen_rcq_artifact, save_official_qwen_rcq_artifact
-from .decomposition import SharedDecomposition, choose_rank, decompose_shared_subspace
+from .decomposition import SharedDecomposition, SharedOutputDecomposition, choose_rank, decompose_shared_output_subspace, decompose_shared_subspace
 from .hadamard import block_hadamard_matrix, deterministic_block_signs
 from .harness import OfficialQwenAblationResult, OfficialQwenHarnessResult, run_official_qwen_ablation, run_official_qwen_harness
 from .metrics import kl_divergence_summary
@@ -38,6 +38,7 @@ __all__ = [
     "RescueConfig",
     "QuantizedResidual",
     "SharedDecomposition",
+    "SharedOutputDecomposition",
     "StorageBreakdown",
     "TextBatchConfig",
     "TextFixtureConfig",
@@ -48,6 +49,7 @@ __all__ = [
     "collect_official_qwen_mlp_inputs",
     "convert_official_qwen35_moe_to_rcq",
     "decompose_shared_subspace",
+    "decompose_shared_output_subspace",
     "deterministic_block_signs",
     "encode_texts_as_toy_byte_tokens",
     "expert_bpw",

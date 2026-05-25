@@ -26,12 +26,20 @@ def expert_bpw(
     shared_bits_per_value: int = 16,
     scale_bits_per_block: int = 16,
     metadata_bits_per_block: int = 2,
+    shared_mode: str = "right_input",
 ) -> StorageBreakdown:
     """Compute honest effective bits per original expert weight."""
     if widths.shape != (num_experts, rows, (cols + block_size - 1) // block_size):
         raise ValueError("widths shape must be [num_experts, rows, ceil(cols / block_size)].")
 
-    shared_bits = shared_bits_per_value * (rank * cols + num_experts * rows * rank)
+    if shared_mode == "right_input":
+        shared_bits = shared_bits_per_value * (rank * cols + num_experts * rows * rank)
+    elif shared_mode == "left_output":
+        shared_bits = shared_bits_per_value * (rows * rank + num_experts * rank * cols)
+    elif shared_mode == "none":
+        shared_bits = 0
+    else:
+        raise ValueError(f"unsupported shared_mode: {shared_mode!r}")
     valid_per_block = []
     for block_index in range(widths.shape[-1]):
         start = block_index * block_size
@@ -44,4 +52,3 @@ def expert_bpw(
     total_bits = shared_bits + index_bits + scale_bits + metadata_bits
     bpw = total_bits / (num_experts * rows * cols)
     return StorageBreakdown(shared_bits, index_bits, scale_bits, metadata_bits, total_bits, bpw)
-

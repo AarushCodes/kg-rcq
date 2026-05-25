@@ -107,3 +107,27 @@ def test_official_qwen_rcq_conversion_runs_with_down_none_mode():
     assert q_model.model.layers[0].mlp.experts.q_down.shared_mode == "none"
     assert int((q_model.model.layers[0].mlp.experts.q_down.q_residuals[0].widths == 1).sum()) == 0
     assert torch.isfinite(logits).all()
+
+
+def test_official_qwen_rcq_conversion_runs_with_down_left_output_mode():
+    torch.manual_seed(21)
+    model = make_tiny_official_qwen35_moe(vocab_size=32, hidden_size=8, moe_intermediate_size=8, num_hidden_layers=1)
+    calibration_ids = torch.randint(0, model.config.vocab_size, (3, 4))
+    eval_ids = torch.randint(0, model.config.vocab_size, (2, 4))
+
+    q_model = convert_official_qwen35_moe_to_rcq(
+        model,
+        calibration_ids,
+        RescueConfig.down_min2_5p4(block_size=8),
+        rank=4,
+        fit_correction=False,
+        down_shared_mode="left_output",
+        down_moment_mode="per_expert",
+    )
+    logits = q_model(input_ids=eval_ids, use_cache=False).logits
+    q_down = q_model.model.layers[0].mlp.experts.q_down
+
+    assert q_down.shared_mode == "left_output"
+    assert q_down.output_decomposition is not None
+    assert q_down.output_decomposition.u_shared.shape == (model.config.hidden_size, 4)
+    assert torch.isfinite(logits).all()

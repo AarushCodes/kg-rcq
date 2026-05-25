@@ -16,6 +16,7 @@ class LinearCalibrationStats:
     per_expert_router_z: torch.Tensor | None = None
     per_expert_selected_count: torch.Tensor | None = None
     global_rotated_second_moments: torch.Tensor | None = None
+    down_output_covariance: torch.Tensor | None = None
 
 
 def accumulate_covariance_and_moments(
@@ -28,6 +29,7 @@ def accumulate_covariance_and_moments(
     model_name: str,
     layer_id: int,
     linear_type: str,
+    outputs_by_expert: list[list[torch.Tensor]] | None = None,
     eps: float = 1e-12,
 ) -> LinearCalibrationStats:
     """Accumulate router-weighted covariance and rotated diagonal moments.
@@ -38,9 +40,15 @@ def accumulate_covariance_and_moments(
     first_activation = next((items[0] for items in activations_by_expert if items), None)
     if first_activation is None:
         raise ValueError("at least one calibration activation is required.")
+    first_output = next((items[0] for items in outputs_by_expert if items), None) if outputs_by_expert is not None else None
     dtype = first_activation.dtype
     device = first_activation.device
     covariance_sum = torch.zeros((input_dim, input_dim), dtype=dtype, device=device)
+    output_covariance_sum = (
+        torch.zeros((first_output.numel(), first_output.numel()), dtype=dtype, device=device)
+        if first_output is not None
+        else None
+    )
     expert_usage = torch.zeros(num_experts, dtype=dtype, device=device)
     padded_dim = ((input_dim + block_size - 1) // block_size) * block_size
     num_blocks = padded_dim // block_size
@@ -50,9 +58,12 @@ def accumulate_covariance_and_moments(
     total_weight = torch.zeros((), dtype=dtype, device=device)
 
     for expert_id in range(num_experts):
-        for activation, router_weight in zip(activations_by_expert[expert_id], router_weights_by_expert[expert_id]):
+        output_items = outputs_by_expert[expert_id] if outputs_by_expert is not None else [None] * len(activations_by_expert[expert_id])
+        for activation, router_weight, output in zip(activations_by_expert[expert_id], router_weights_by_expert[expert_id], output_items):
             weight = router_weight.square()
             covariance_sum += weight * torch.outer(activation, activation)
+            if output_covariance_sum is not None and output is not None:
+                output_covariance_sum += weight * torch.outer(output, output)
             expert_usage[expert_id] += weight
             selected_count[expert_id] += 1
             total_weight += weight
@@ -75,6 +86,7 @@ def accumulate_covariance_and_moments(
 
     covariance = covariance_sum / (total_weight + eps)
     rotated_second_moments = moment_sum / (total_weight + eps)
+    output_covariance = output_covariance_sum / (total_weight + eps) if output_covariance_sum is not None else None
     importance = expert_usage / (expert_usage.sum() + eps)
     cond = per_expert_moment_sum / expert_usage.clamp_min(eps).view(num_experts, 1, 1)
     shrink = selected_count / (selected_count + 4096.0)
@@ -88,4 +100,5 @@ def accumulate_covariance_and_moments(
         per_expert_router_z=expert_usage,
         per_expert_selected_count=selected_count,
         global_rotated_second_moments=rotated_second_moments,
+        down_output_covariance=output_covariance,
     )

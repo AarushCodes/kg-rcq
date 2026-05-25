@@ -3,6 +3,7 @@ import torch
 from rcq_moe.codebooks import lloyd_max_codebook
 from rcq_moe.hadamard import block_hadamard_matrix, signed_hadamard_q
 from rcq_moe.quantization import RescueConfig, binary_quantize_block, lloyd_quantize_block, quantize_residuals
+from rcq_moe.stats import accumulate_covariance_and_moments
 from rcq_moe.storage import expert_bpw
 
 
@@ -99,6 +100,27 @@ def test_quantize_residuals_accepts_per_expert_moments():
     assert all(q.dequantize().shape == original.shape for q, original in zip(quantized, residuals))
 
 
+def test_cold_expert_shrinkage_returns_finite_nonnegative_moments():
+    activations = [[torch.ones(4)], []]
+    routers = [[torch.tensor(0.5)], []]
+
+    stats = accumulate_covariance_and_moments(
+        activations,
+        routers,
+        num_experts=2,
+        input_dim=4,
+        block_size=4,
+        model_name="tiny",
+        layer_id=0,
+        linear_type="down",
+    )
+
+    assert stats.per_expert_rotated_second_moments is not None
+    assert torch.isfinite(stats.per_expert_rotated_second_moments).all()
+    assert (stats.per_expert_rotated_second_moments >= 0).all()
+    assert torch.allclose(stats.per_expert_rotated_second_moments[1], stats.global_rotated_second_moments)
+
+
 def test_storage_bpw_counts_padding_excluded_indices_and_shared_overhead():
     widths = torch.tensor([[[1, 4], [2, 1]], [[1, 1], [4, 2]]])
     report = expert_bpw(num_experts=2, rows=2, cols=10, rank=1, widths=widths, block_size=8)
@@ -106,3 +128,12 @@ def test_storage_bpw_counts_padding_excluded_indices_and_shared_overhead():
     assert report.shared_bits == 16 * (1 * 10 + 2 * 2 * 1)
     assert report.total_bits == report.shared_bits + report.index_bits + report.scale_bits + report.metadata_bits
     assert report.bpw == report.total_bits / 40
+
+
+def test_storage_bpw_counts_left_output_and_none_shared_overhead():
+    widths = torch.full((2, 3, 2), 2)
+    left = expert_bpw(num_experts=2, rows=3, cols=10, rank=2, widths=widths, block_size=8, shared_mode="left_output")
+    none = expert_bpw(num_experts=2, rows=3, cols=10, rank=2, widths=widths, block_size=8, shared_mode="none")
+
+    assert left.shared_bits == 16 * (3 * 2 + 2 * 2 * 10)
+    assert none.shared_bits == 0

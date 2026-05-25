@@ -8,7 +8,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from .correction import OnlineChannelRegression
-from .decomposition import SharedDecomposition, decompose_shared_subspace
+from .decomposition import SharedDecomposition, SharedOutputDecomposition, decompose_shared_output_subspace, decompose_shared_subspace
 from .quantization import QuantizedResidual, RescueConfig, quantize_residuals
 from .stats import LinearCalibrationStats, accumulate_covariance_and_moments
 
@@ -18,6 +18,9 @@ class OfficialQwen35RCQLinearSet:
     decomposition: SharedDecomposition
     q_residuals: list[QuantizedResidual]
     shared_mode: str = "right_input"
+    output_decomposition: SharedOutputDecomposition | None = None
+    residual_config: str | None = None
+    moment_mode: str = "global"
 
     def forward(self, hidden: torch.Tensor, expert_id: int) -> torch.Tensor:
         if self.shared_mode == "none":
@@ -29,6 +32,11 @@ class OfficialQwen35RCQLinearSet:
         elif self.shared_mode == "right_input":
             a_factor = self.decomposition.a_factors[expert_id]
             shared = (hidden @ self.decomposition.b_shared.T) @ a_factor.T
+        elif self.shared_mode == "left_output":
+            if self.output_decomposition is None:
+                raise ValueError("left_output linear set requires output_decomposition.")
+            c_factor = self.output_decomposition.c_factors[expert_id]
+            shared = (hidden @ c_factor.T) @ self.output_decomposition.u_shared.T
         else:
             raise ValueError(f"unsupported shared_mode: {self.shared_mode!r}")
         residual = hidden @ self.q_residuals[expert_id].dequantize().T
@@ -41,6 +49,10 @@ class OfficialQwen35LinearDiagnostics:
     captured_energy: float
     bpw: float
     width_percentages: dict[int, float]
+    shared_mode: str = "right_input"
+    rank: int = 0
+    residual_config: str | None = None
+    moment_mode: str = "global"
 
 
 @dataclass(frozen=True)
@@ -128,10 +140,24 @@ def _make_linear_set_from_state(state: dict[str, torch.Tensor | int | str], pref
         v_r=state[f"{prefix}.v_r"],
         captured_energy=float(state[f"{prefix}.captured_energy"]),
     )
+    shared_mode = str(state.get(f"{prefix}.shared_mode", "right_input"))
+    output_decomposition = None
+    if shared_mode == "left_output":
+        output_decomposition = SharedOutputDecomposition(
+            u_shared=state[f"{prefix}.u_shared"],
+            c_factors=[state[f"{prefix}.c{expert_id}"] for expert_id in range(num_experts)],
+            residuals=[torch.empty(0, dtype=residual_template.dtype, device=residual_template.device) for _ in range(num_experts)],
+            eigvals=state[f"{prefix}.output_eigvals"],
+            eigvecs=state[f"{prefix}.output_eigvecs"],
+            captured_energy=float(state[f"{prefix}.captured_energy"]),
+        )
     return OfficialQwen35RCQLinearSet(
         decomposition=decomposition,
         q_residuals=residuals,
-        shared_mode=str(state.get(f"{prefix}.shared_mode", "right_input")),
+        shared_mode=shared_mode,
+        output_decomposition=output_decomposition,
+        residual_config=(str(state[f"{prefix}.residual_config"]) or None) if f"{prefix}.residual_config" in state else None,
+        moment_mode=str(state.get(f"{prefix}.moment_mode", "global")),
     )
 
 
@@ -249,6 +275,7 @@ def _collect_block_stats(
     up_router: list[list[torch.Tensor]] = [[] for _ in range(num_experts)]
     down_acts: list[list[torch.Tensor]] = [[] for _ in range(num_experts)]
     down_router: list[list[torch.Tensor]] = [[] for _ in range(num_experts)]
+    down_outputs: list[list[torch.Tensor]] = [[] for _ in range(num_experts)]
 
     for token_id in range(flat_hidden.shape[0]):
         token = flat_hidden[token_id]
@@ -262,7 +289,9 @@ def _collect_block_stats(
 
             packed = F.linear(token, experts.gate_up_proj[expert_id])
             gate, up = packed[:intermediate_dim], packed[intermediate_dim:]
-            down_acts[expert_id].append(experts.act_fn(gate) * up)
+            down_input = experts.act_fn(gate) * up
+            down_acts[expert_id].append(down_input)
+            down_outputs[expert_id].append(F.linear(down_input, experts.down_proj[expert_id]))
             down_router[expert_id].append(router_weight)
 
     return {
@@ -295,6 +324,7 @@ def _collect_block_stats(
             model_name=model_name,
             layer_id=layer_id,
             linear_type="down",
+            outputs_by_expert=down_outputs,
         ),
     }
 
@@ -312,6 +342,7 @@ def _quantize_linear_set(
     moment_mode: str = "global",
 ) -> OfficialQwen35RCQLinearSet:
     expert_weights = [weights[expert_id].detach().clone() for expert_id in range(weights.shape[0])]
+    output_decomposition = None
     if shared_mode == "right_input":
         decomposition = decompose_shared_subspace(expert_weights, stats.covariance, stats.expert_importance, rank=rank)
     elif shared_mode == "none":
@@ -326,6 +357,24 @@ def _quantize_linear_set(
             eigvecs=torch.empty((cols, 0), dtype=dtype, device=device),
             v_r=torch.empty((cols, 0), dtype=dtype, device=device),
             captured_energy=0.0,
+        )
+    elif shared_mode == "left_output":
+        if stats.down_output_covariance is None:
+            raise ValueError("left_output shared mode requires down_output_covariance.")
+        if rank is None:
+            raise ValueError("left_output shared mode requires an explicit rank.")
+        output_decomposition = decompose_shared_output_subspace(expert_weights, stats.down_output_covariance, rank=rank)
+        rows, cols = expert_weights[0].shape
+        dtype = expert_weights[0].dtype
+        device = expert_weights[0].device
+        decomposition = SharedDecomposition(
+            a_factors=[torch.empty((rows, 0), dtype=dtype, device=device) for _ in expert_weights],
+            b_shared=torch.empty((0, cols), dtype=dtype, device=device),
+            residuals=output_decomposition.residuals,
+            eigvals=torch.empty(0, dtype=dtype, device=device),
+            eigvecs=torch.empty((cols, 0), dtype=dtype, device=device),
+            v_r=torch.empty((cols, 0), dtype=dtype, device=device),
+            captured_energy=output_decomposition.captured_energy,
         )
     else:
         raise ValueError(f"unsupported shared_mode: {shared_mode!r}")
@@ -345,7 +394,14 @@ def _quantize_linear_set(
         layer_id=layer_id,
         linear_type=linear_type,
     )
-    return OfficialQwen35RCQLinearSet(decomposition=decomposition, q_residuals=q_residuals, shared_mode=shared_mode)
+    return OfficialQwen35RCQLinearSet(
+        decomposition=decomposition,
+        q_residuals=q_residuals,
+        shared_mode=shared_mode,
+        output_decomposition=output_decomposition,
+        residual_config=rcq_config.name,
+        moment_mode=moment_mode,
+    )
 
 
 def _linear_diagnostics(
@@ -369,6 +425,7 @@ def _linear_diagnostics(
         widths=widths,
         block_size=block_size,
         scale_bits_per_block=scale_bits,
+        shared_mode=linear_set.shared_mode,
     )
     total = widths.numel()
     percentages = {bit: float((widths == bit).sum().item() / total) for bit in (1, 2, 4)}
@@ -377,6 +434,10 @@ def _linear_diagnostics(
         captured_energy=linear_set.decomposition.captured_energy,
         bpw=report.bpw,
         width_percentages=percentages,
+        shared_mode=linear_set.shared_mode,
+        rank=rank,
+        residual_config=linear_set.residual_config,
+        moment_mode=linear_set.moment_mode,
     )
 
 
@@ -427,7 +488,7 @@ def _convert_block(
     )
     rank_gate = q_gate.decomposition.b_shared.shape[0]
     rank_up = q_up.decomposition.b_shared.shape[0]
-    rank_down = q_down.decomposition.b_shared.shape[0]
+    rank_down = q_down.output_decomposition.u_shared.shape[1] if q_down.output_decomposition is not None else q_down.decomposition.b_shared.shape[0]
     diagnostics = {
         "gate": _linear_diagnostics("gate", q_gate, rows=intermediate_dim, cols=experts.hidden_dim, rank=rank_gate, block_size=rcq_config.block_size, scale_bits=rcq_config.scale_bits),
         "up": _linear_diagnostics("up", q_up, rows=intermediate_dim, cols=experts.hidden_dim, rank=rank_up, block_size=rcq_config.block_size, scale_bits=rcq_config.scale_bits),

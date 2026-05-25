@@ -30,7 +30,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from rcq_moe.correction import OnlineChannelRegression
-from rcq_moe.decomposition import SharedDecomposition, decompose_shared_subspace
+from rcq_moe.decomposition import SharedDecomposition, SharedOutputDecomposition, decompose_shared_output_subspace, decompose_shared_subspace
 from rcq_moe.hadamard import pad_last_dim, rotate_activation_block, signed_hadamard_q
 from rcq_moe.quantization import RescueConfig, lloyd_quantize_block, select_rescue_widths
 from rcq_moe.stats import LinearCalibrationStats
@@ -88,6 +88,7 @@ class StreamingStats:
     covariance_sum: torch.Tensor
     moment_sum: torch.Tensor
     per_expert_moment_sum: torch.Tensor
+    output_covariance_sum: torch.Tensor | None
     expert_usage: torch.Tensor
     selected_count: torch.Tensor
     total_weight: torch.Tensor
@@ -107,12 +108,18 @@ class StreamingStats:
         layer_id: int,
         linear_type: str,
         device: torch.device,
+        output_dim: int | None = None,
     ) -> "StreamingStats":
         padded_dim = ((input_dim + block_size - 1) // block_size) * block_size
         return cls(
             covariance_sum=torch.zeros((input_dim, input_dim), dtype=torch.float32, device=device),
             moment_sum=torch.zeros((padded_dim // block_size, block_size), dtype=torch.float32, device=device),
             per_expert_moment_sum=torch.zeros((num_experts, padded_dim // block_size, block_size), dtype=torch.float32, device=device),
+            output_covariance_sum=(
+                torch.zeros((output_dim, output_dim), dtype=torch.float32, device=device)
+                if output_dim is not None
+                else None
+            ),
             expert_usage=torch.zeros(num_experts, dtype=torch.float32, device=device),
             selected_count=torch.zeros(num_experts, dtype=torch.float32, device=device),
             total_weight=torch.zeros((), dtype=torch.float32, device=device),
@@ -122,13 +129,16 @@ class StreamingStats:
             linear_type=linear_type,
         )
 
-    def update(self, activations: torch.Tensor, router_weights: torch.Tensor, expert_id: int) -> None:
+    def update(self, activations: torch.Tensor, router_weights: torch.Tensor, expert_id: int, outputs: torch.Tensor | None = None) -> None:
         if activations.numel() == 0:
             return
         acts = activations.float()
         weights = router_weights.float()
         weighted = acts * weights[:, None]
         self.covariance_sum += acts.T @ weighted
+        if self.output_covariance_sum is not None and outputs is not None:
+            outs = outputs.float()
+            self.output_covariance_sum += outs.T @ (outs * weights[:, None])
         self.expert_usage[expert_id] += weights.sum()
         self.selected_count[expert_id] += acts.shape[0]
         self.total_weight += weights.sum()
@@ -159,6 +169,7 @@ class StreamingStats:
         shrink = self.selected_count / (self.selected_count + 4096.0)
         per_expert = shrink.view(-1, 1, 1) * cond + (1.0 - shrink).view(-1, 1, 1) * moments
         per_expert = torch.nan_to_num(per_expert, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        output_covariance = self.output_covariance_sum / denom if self.output_covariance_sum is not None else None
         return LinearCalibrationStats(
             covariance=covariance,
             expert_importance=importance,
@@ -167,6 +178,7 @@ class StreamingStats:
             per_expert_router_z=self.expert_usage,
             per_expert_selected_count=self.selected_count,
             global_rotated_second_moments=moments,
+            down_output_covariance=output_covariance,
         )
 
 
@@ -179,9 +191,15 @@ class QuantizedLinear:
     shared_mode: str = "right_input"
     residual_config: str | None = None
     moment_mode: str = "global"
+    output_decomposition: SharedOutputDecomposition | None = None
 
     def weight_for_expert(self, expert_id: int) -> torch.Tensor:
-        shared = self.decomposition.a_factors[expert_id] @ self.decomposition.b_shared
+        if self.shared_mode == "left_output":
+            if self.output_decomposition is None:
+                raise ValueError("left_output quantized linear requires output_decomposition")
+            shared = self.output_decomposition.u_shared @ self.output_decomposition.c_factors[expert_id]
+        else:
+            shared = self.decomposition.a_factors[expert_id] @ self.decomposition.b_shared
         return shared + self.residuals[expert_id]
 
 
@@ -931,6 +949,7 @@ def collect_stats(
             layer_id=0,
             linear_type="down",
             device=device,
+            output_dim=layer.down_weight.shape[1],
         ),
     }
 
@@ -954,7 +973,8 @@ def collect_stats(
             gate = _linear_weight(current, layer.gate_weight[expert_id].to(device=device, dtype=hidden.dtype))
             up = _linear_weight(current, layer.up_weight[expert_id].to(device=device, dtype=hidden.dtype))
             down_input = _act(gate, layer.hidden_act) * up
-            stats["down"].update(down_input, stat_weight, expert_id)
+            down_output = _linear_weight(down_input, layer.down_weight[expert_id].to(device=device, dtype=hidden.dtype))
+            stats["down"].update(down_input, stat_weight, expert_id, outputs=down_output)
         del input_ids, hidden, router_weights, selected
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1057,6 +1077,7 @@ def collect_stats_from_cache(
             layer_id=0,
             linear_type="down",
             device=device,
+            output_dim=layer.down_weight.shape[1],
         ),
     }
     started = time.time()
@@ -1079,7 +1100,8 @@ def collect_stats_from_cache(
             gate = _linear_weight(current, layer.gate_weight[expert_id].to(device=device, dtype=hidden.dtype))
             up = _linear_weight(current, layer.up_weight[expert_id].to(device=device, dtype=hidden.dtype))
             down_input = _act(gate, layer.hidden_act) * up
-            stats["down"].update(down_input, stat_weight, expert_id)
+            down_output = _linear_weight(down_input, layer.down_weight[expert_id].to(device=device, dtype=hidden.dtype))
+            stats["down"].update(down_input, stat_weight, expert_id, outputs=down_output)
         del hidden, router_weights, selected
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1091,6 +1113,63 @@ def collect_stats_from_cache(
             )
     finished = {name: item.finish() for name, item in stats.items()}
     _log(f"collect_stats_from_cache done weighted={weighted} elapsed_sec={time.time() - started:.1f}", force=True)
+    return finished
+
+
+def collect_sequential_down_stats_from_cache(
+    batches: list[CachedBatch],
+    layer: LoadedLayer,
+    q_gate: QuantizedLinear,
+    q_up: QuantizedLinear,
+    *,
+    block_size: int,
+    device: torch.device,
+    weighted: bool,
+) -> LinearCalibrationStats:
+    _log(f"collect_sequential_down_stats_from_cache start batches={len(batches)} weighted={weighted}", force=True)
+    stats = StreamingStats.create(
+        num_experts=layer.router_weight.shape[0],
+        input_dim=layer.down_weight.shape[2],
+        block_size=block_size,
+        model_name="qwen36-single-layer",
+        layer_id=0,
+        linear_type="down",
+        device=device,
+        output_dim=layer.down_weight.shape[1],
+    )
+    started = time.time()
+    token_total = 0
+    for batch_idx, batch in enumerate(batches, start=1):
+        hidden = batch.hidden.to(device=device)
+        router_weights = batch.router_weights.to(device=device)
+        selected = batch.selected_experts.to(device=device)
+        token_total += batch.token_count
+        for expert_id in range(layer.router_weight.shape[0]):
+            positions = selected == expert_id
+            if not positions.any():
+                continue
+            token_idx, slot_idx = torch.where(positions)
+            current = hidden[token_idx]
+            route = router_weights[token_idx, slot_idx]
+            stat_weight = route.square() if weighted else torch.ones_like(route)
+            gate_w = q_gate.weight_for_expert(expert_id).to(device=device, dtype=hidden.dtype)
+            up_w = q_up.weight_for_expert(expert_id).to(device=device, dtype=hidden.dtype)
+            gate = _linear_weight(current, gate_w)
+            up = _linear_weight(current, up_w)
+            down_input = _act(gate, layer.hidden_act) * up
+            down_output = _linear_weight(down_input, layer.down_weight[expert_id].to(device=device, dtype=hidden.dtype))
+            stats.update(down_input, stat_weight, expert_id, outputs=down_output)
+        del hidden, router_weights, selected
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if batch_idx == 1 or batch_idx % 4 == 0 or batch_idx == len(batches):
+            _log(
+                f"collect_sequential_down_stats_from_cache progress batches={batch_idx}/{len(batches)} "
+                f"tokens={token_total} elapsed_sec={time.time() - started:.1f}",
+                force=True,
+            )
+    finished = stats.finish()
+    _log(f"collect_sequential_down_stats_from_cache done elapsed_sec={time.time() - started:.1f}", force=True)
     return finished
 
 
@@ -1226,10 +1305,18 @@ def quantize_linear(
     expert_score_weights: torch.Tensor | None = None,
 ) -> QuantizedLinear:
     expert_weights = [weights[expert_id].float() for expert_id in range(weights.shape[0])]
+    output_decomposition = None
     if shared_mode == "right_input":
         decomposition = decompose_shared_subspace(expert_weights, stats.covariance.float(), stats.expert_importance.float(), rank=rank)
     elif shared_mode == "none":
         decomposition = _no_shared_decomposition(expert_weights)
+    elif shared_mode == "left_output":
+        if stats.down_output_covariance is None:
+            raise ValueError("left_output shared mode requires down_output_covariance")
+        output_decomposition = decompose_shared_output_subspace(expert_weights, stats.down_output_covariance.float(), rank=rank)
+        decomposition = _no_shared_decomposition(expert_weights)
+        decomposition.residuals = output_decomposition.residuals
+        decomposition.captured_energy = output_decomposition.captured_energy
     else:
         raise ValueError(f"unsupported shared_mode: {shared_mode!r}")
     if moment_mode == "global":
@@ -1251,13 +1338,15 @@ def quantize_linear(
         linear_type=linear_type,
         expert_score_weights=expert_score_weights,
     )
+    shared_rank = output_decomposition.u_shared.shape[1] if output_decomposition is not None else decomposition.b_shared.shape[0]
     report = expert_bpw(
         num_experts=weights.shape[0],
         rows=weights.shape[1],
         cols=weights.shape[2],
-        rank=decomposition.b_shared.shape[0],
+        rank=shared_rank,
         widths=widths,
         block_size=moments.shape[-1],
+        shared_mode=shared_mode,
     )
     return QuantizedLinear(
         decomposition=decomposition,
@@ -1267,6 +1356,7 @@ def quantize_linear(
         shared_mode=shared_mode,
         residual_config=rescue_config.name if rescue_config is not None else None,
         moment_mode=moment_mode,
+        output_decomposition=output_decomposition,
     )
 
 
@@ -1283,6 +1373,7 @@ def build_q_moe(
     down_rescue_config: RescueConfig | None = None,
     down_shared_mode: str = "right_input",
     down_moment_mode: str = "global",
+    down_sequential_stats: bool = False,
 ) -> QuantizedMoe:
     gate_rescue_config = rescue_config if gate_rescue_config is None else gate_rescue_config
     up_rescue_config = rescue_config if up_rescue_config is None else up_rescue_config
@@ -1293,7 +1384,8 @@ def build_q_moe(
         f"weighted_scale={weighted_scale} gate_rescue={gate_rescue_config.name if gate_rescue_config else None} "
         f"up_rescue={up_rescue_config.name if up_rescue_config else None} "
         f"down_rescue={down_rescue_config.name if down_rescue_config else None} "
-        f"down_shared_mode={down_shared_mode} down_moment_mode={down_moment_mode}",
+        f"down_shared_mode={down_shared_mode} down_moment_mode={down_moment_mode} "
+        f"down_sequential_stats={down_sequential_stats}",
         force=True,
     )
     started = time.time()
@@ -1508,6 +1600,8 @@ def _width_percentages(q: QuantizedLinear) -> dict[str, float]:
 
 
 def _diagnostics(q_moe: QuantizedMoe) -> dict[str, Any]:
+    down_left = q_moe.down.output_decomposition.captured_energy if q_moe.down.output_decomposition is not None else None
+    down_legacy = q_moe.down.decomposition.captured_energy if q_moe.down.shared_mode == "right_input" else None
     return {
         "gate": {
             "captured_energy": q_moe.gate.decomposition.captured_energy,
@@ -1527,6 +1621,8 @@ def _diagnostics(q_moe: QuantizedMoe) -> dict[str, Any]:
         },
         "down": {
             "captured_energy": q_moe.down.decomposition.captured_energy,
+            "down_legacy_right_captured_energy": down_legacy,
+            "down_left_output_captured_energy": down_left,
             "bpw": q_moe.down.bpw,
             "width_percentages": _width_percentages(q_moe.down),
             "shared_mode": q_moe.down.shared_mode,
@@ -1562,8 +1658,11 @@ def run_ablation(
     down_rescue_config: RescueConfig | None = None,
     down_shared_mode: str = "right_input",
     down_moment_mode: str = "global",
+    down_sequential_stats: bool = False,
 ) -> dict[str, Any]:
     _log(f"ablation start label={label}", force=True)
+    if down_sequential_stats:
+        raise ValueError("down_sequential_stats is implemented for cached ablations only.")
     started = time.time()
     q_moe = build_q_moe(
         layer,
@@ -1577,6 +1676,7 @@ def run_ablation(
         down_rescue_config=down_rescue_config,
         down_shared_mode=down_shared_mode,
         down_moment_mode=down_moment_mode,
+        down_sequential_stats=down_sequential_stats,
     )
     correction = None
     if fit_correction:
@@ -1622,7 +1722,9 @@ def run_ablation(
         "down_residual_config": q_moe.down.residual_config,
         "down_shared_mode": q_moe.down.shared_mode,
         "down_moment_mode": q_moe.down.moment_mode,
-        "down_sequential_stats": False,
+        "down_sequential_stats": down_sequential_stats,
+        "down_legacy_right_captured_energy": q_moe.down.decomposition.captured_energy if q_moe.down.shared_mode == "right_input" else None,
+        "down_left_output_captured_energy": q_moe.down.output_decomposition.captured_energy if q_moe.down.output_decomposition is not None else None,
         "gate_bpw": q_moe.gate.bpw,
         "up_bpw": q_moe.up.bpw,
         "down_bpw": q_moe.down.bpw,
@@ -1663,12 +1765,52 @@ def run_ablation_cached(
     down_rescue_config: RescueConfig | None = None,
     down_shared_mode: str = "right_input",
     down_moment_mode: str = "global",
+    down_sequential_stats: bool = False,
 ) -> dict[str, Any]:
     _log(f"ablation start label={label}", force=True)
     started = time.time()
+    build_stats = stats
+    if down_sequential_stats:
+        block_size = stats["down"].rotated_second_moments.shape[-1]
+        rank_hidden = _rank_for_divisor(layer.router_weight.shape[1], rank_divisor)
+        gate_cfg = rescue_config if gate_rescue_config is None else gate_rescue_config
+        up_cfg = rescue_config if up_rescue_config is None else up_rescue_config
+        q_gate = quantize_linear(
+            layer.gate_weight,
+            stats["gate"],
+            rank=rank_hidden,
+            use_hadamard=use_hadamard,
+            weighted_scale=weighted_scale,
+            rescue_config=gate_cfg,
+            model_name="qwen36-single-layer",
+            layer_id=0,
+            linear_type="gate",
+        )
+        q_up = quantize_linear(
+            layer.up_weight,
+            stats["up"],
+            rank=rank_hidden,
+            use_hadamard=use_hadamard,
+            weighted_scale=weighted_scale,
+            rescue_config=up_cfg,
+            model_name="qwen36-single-layer",
+            layer_id=0,
+            linear_type="up",
+        )
+        sequential_down = collect_sequential_down_stats_from_cache(
+            calib_batches,
+            layer,
+            q_gate,
+            q_up,
+            block_size=block_size,
+            device=device,
+            weighted=True,
+        )
+        build_stats = dict(stats)
+        build_stats["down"] = sequential_down
     q_moe = build_q_moe(
         layer,
-        stats,
+        build_stats,
         rank_divisor=rank_divisor,
         use_hadamard=use_hadamard,
         weighted_scale=weighted_scale,
@@ -1678,6 +1820,7 @@ def run_ablation_cached(
         down_rescue_config=down_rescue_config,
         down_shared_mode=down_shared_mode,
         down_moment_mode=down_moment_mode,
+        down_sequential_stats=down_sequential_stats,
     )
     correction = None
     if fit_correction:
@@ -1717,7 +1860,9 @@ def run_ablation_cached(
         "down_residual_config": q_moe.down.residual_config,
         "down_shared_mode": q_moe.down.shared_mode,
         "down_moment_mode": q_moe.down.moment_mode,
-        "down_sequential_stats": False,
+        "down_sequential_stats": down_sequential_stats,
+        "down_legacy_right_captured_energy": q_moe.down.decomposition.captured_energy if q_moe.down.shared_mode == "right_input" else None,
+        "down_left_output_captured_energy": q_moe.down.output_decomposition.captured_energy if q_moe.down.output_decomposition is not None else None,
         "gate_bpw": q_moe.gate.bpw,
         "up_bpw": q_moe.up.bpw,
         "down_bpw": q_moe.down.bpw,
@@ -1739,9 +1884,6 @@ def run_ablation_cached(
 
 def _down_v2_experiments(block_size: int) -> list[tuple[str, dict[str, Any] | str]]:
     """Down-projection V2 rows from FIX_DOWN_PROJ_SPEC.md.
-
-    This slice runs D0/D3/D4 locally. Left-output rows remain explicit not-run
-    entries until their decomposition and sequential stats are implemented.
     """
     return [
         (
@@ -1791,9 +1933,57 @@ def _down_v2_experiments(block_size: int) -> list[tuple[str, dict[str, Any] | st
                 fit_correction=True,
             ),
         ),
-        ("D5_gate_up_1p55_down_left_output_mix_1bit", "not_run:left_output sequential down calibration is not implemented in this slice"),
-        ("D6_gate_up_1p55_down_left_output_min2_5p4", "not_run:left_output sequential down calibration is not implemented in this slice"),
-        ("D7_gate_up_1p75_down_left_output_min2_20p4", "not_run:left_output sequential down calibration is not implemented in this slice"),
+        (
+            "D5_gate_up_1p55_down_left_output_mix_1bit",
+            dict(
+                stats_kind="weighted",
+                rank_divisor=128,
+                use_hadamard=True,
+                weighted_scale=True,
+                rescue_config=None,
+                gate_rescue_config=RescueConfig.rcq_1p55(block_size),
+                up_rescue_config=RescueConfig.rcq_1p55(block_size),
+                down_rescue_config=RescueConfig.down_mix_1bit(block_size),
+                down_shared_mode="left_output",
+                down_moment_mode="per_expert",
+                down_sequential_stats=True,
+                fit_correction=True,
+            ),
+        ),
+        (
+            "D6_gate_up_1p55_down_left_output_min2_5p4",
+            dict(
+                stats_kind="weighted",
+                rank_divisor=128,
+                use_hadamard=True,
+                weighted_scale=True,
+                rescue_config=None,
+                gate_rescue_config=RescueConfig.rcq_1p55(block_size),
+                up_rescue_config=RescueConfig.rcq_1p55(block_size),
+                down_rescue_config=RescueConfig.down_min2_5p4(block_size),
+                down_shared_mode="left_output",
+                down_moment_mode="per_expert",
+                down_sequential_stats=True,
+                fit_correction=True,
+            ),
+        ),
+        (
+            "D7_gate_up_1p75_down_left_output_min2_20p4",
+            dict(
+                stats_kind="weighted",
+                rank_divisor=128,
+                use_hadamard=True,
+                weighted_scale=True,
+                rescue_config=None,
+                gate_rescue_config=RescueConfig.rcq_1p75(block_size),
+                up_rescue_config=RescueConfig.rcq_1p75(block_size),
+                down_rescue_config=RescueConfig.down_min2_20p4(block_size),
+                down_shared_mode="left_output",
+                down_moment_mode="per_expert",
+                down_sequential_stats=True,
+                fit_correction=True,
+            ),
+        ),
     ]
 
 
