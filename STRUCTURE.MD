@@ -173,8 +173,9 @@ Contains:
 - A Down V2 time-to-insight Python cell that pins the reviewed left-output
   implementation commit, skips old non-Down-V2 rows through a synthetic resume
   JSON, runs D0/D3/D4/D5/D6 by default, and packages compact outputs.
-  The first pasted run from this cell is recorded in `state.md` and its compact
-  local outputs are under ignored `runs/run2/`.
+  The first pasted run from this cell, including the recovered D3 row, is
+  recorded in `state.md` and its compact local outputs are under ignored
+  `runs/run2/`.
 - Result-bundle packaging instructions that include only compact JSON/log files,
   not model shards or Hugging Face cache contents.
 
@@ -690,7 +691,8 @@ Contains:
   config, moment mode, sequential-stat flag, gate/up/down bpw, average expert
   bpw, and down legacy/left-output captured-energy diagnostics.
 - The first Down V2 pilot output bundle was saved locally under ignored
-  `runs/run2/`; inspect only compact JSON/log files from that directory.
+  `runs/run2/`; `state.md` records the compact D0/D3/D4/D5/D6 summary while
+  preserving D7 as intentionally skipped by the time-to-insight cell.
 - Compact outputs: `run_manifest.json`, `index_summary.json`,
   `nmse_denominators.json`, `ablation_metrics.partial.json`,
   `ablation_metrics.json`, and, for denominator-only annotation,

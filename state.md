@@ -17,8 +17,9 @@ control-plane dry-run. A Kaggle T4 x2 fallback has now produced a first
 pretrained, layer-local Qwen3.6 RCQ pilot on true layer-0 MoE inputs. The
 repository now has a public-facing `README.MD` copied from the current README
 draft. The Down Projection V2 local implementation is now in place for both
-the no-shared min-2-bit path and the left-output shared-subspace path, with
-Kaggle commands prepared for the next layer-local D0/D3/D4/D5/D6 evidence run.
+the no-shared min-2-bit path and the left-output shared-subspace path, and the
+first Kaggle T4 x2 layer-local D0/D3/D4/D5/D6 evidence run is recorded under
+ignored local outputs in `runs/run2`.
 
 This is still a research/plumbing prototype:
 
@@ -248,8 +249,9 @@ This is still a research/plumbing prototype:
   - Adds local tests for down min-2 configs, per-expert moment handling,
     cold-expert shrinkage, left-output decomposition, official conversion,
     artifact round-trip, and layer-local D-row construction.
-  - No pretrained Down V2 quality claim has been made yet; the D0/D3/D4/D5/D6
-    Kaggle run is the next evidence slice.
+  - No pretrained Down V2 quality claim has been made yet; the first
+    D0/D3/D4/D5/D6 Kaggle run is layer-local routed MoE-output NMSE evidence
+    only.
 
 ## Generated Local Data
 
@@ -389,10 +391,12 @@ D0_current_baseline_legacy_right_rcq_1p75_correction:
   down_widths={1: 0.75, 2: 0.2000000477, 4: 0.0499999523}
 
 D3_gate_up_1p55_down_none_min2_5p4_correction:
-  row appears to have been run, but the pasted compact summary omitted the
-  label/MSE/bpw prefix. Only the down widths were visible:
-  down_widths={1: 0.0, 2: 0.9500000477, 4: 0.0499999523}.
-  Inspect runs/run2/ablation_metrics.json before drawing conclusions about D3.
+  average_expert_bpw=1.8392186165
+  gate_bpw=1.5682029724, up_bpw=1.5682029724, down_bpw=2.3812499046
+  heldout_mse=0.0027873133
+  heldout_nmse_mean_square=0.3916009069
+  down_mode=none, down_cfg=down_min2_5p4
+  down_widths={1: 0.0, 2: 0.9500000477, 4: 0.0499999523}
 
 D4_gate_up_1p55_down_none_min2_20p4_correction:
   average_expert_bpw=1.9392186801
@@ -432,6 +436,11 @@ D6 is the best recorded <=1.90 average-bpw row in the pasted summary:
   heldout_nmse=0.3911708661 at average_expert_bpw=1.8497980436.
   Relative improvement vs D0 is about 10.4%.
 
+D3 is the immediate no-shared min-2-bit down fix at <=1.90 average bpw:
+  heldout_nmse=0.3916009069 at average_expert_bpw=1.8392186165.
+  D6 improves over D3 by only about 0.11% relative NMSE, so this pilot does
+  not justify paying left-output shared overhead over `none + down_min2_5p4`.
+
 D4 has the lowest pasted NMSE:
   heldout_nmse=0.3758740844,
   but average_expert_bpw=1.9392186801 exceeds the <=1.90 target.
@@ -439,7 +448,7 @@ D4 has the lowest pasted NMSE:
 D5 is lower bpw than D0 but only modestly improves NMSE:
   heldout_nmse=0.4120189131 at average_expert_bpw=1.5997980436.
 
-Neither pasted <=1.90-bpw row reaches the Down V2 minimum success criterion
+Neither recorded <=1.90-bpw row reaches the Down V2 minimum success criterion
 of heldout NMSE <=0.33. The new left-output down subspace captures about
 6.8% routed down-output energy, better than the old 4.1% legacy-right
 captured-energy diagnostic, but still small.
@@ -742,9 +751,8 @@ e872141 Add streamed text fixture builder
 - There is now a pretrained Qwen3.6 layer-local RCQ pilot for layer 0 on
   Kaggle T4 x2, but no full-model pretrained quality evaluation yet.
 - Down Projection V2 has a first Kaggle T4 x2 layer-local run in `runs/run2`,
-  but the pasted <=1.90-bpw rows have not reached held-out NMSE <=0.33.
-  D3 should be verified from the JSON because its compact pasted line was
-  incomplete.
+  but D3 and D6 stay around held-out NMSE 0.391 at <=1.90 average bpw, above
+  the <=0.33 success threshold.
 - The API-pushed competition-attached Kaggle notebook selected P100 rather than
   RTX PRO 6000, so it is not the desired validation path for Slice 3.
 - The manually created RTX PRO 6000 Kaggle notebook currently has internet
@@ -766,12 +774,13 @@ e872141 Add streamed text fixture builder
 Continue the pretrained-compatible validation path slice by slice:
 
 1. Extend the Kaggle T4 x2 layer-local pilot.
-   - Inspect the compact JSON in `runs/run2` to recover the full D3 row and
-     verify the pasted D0/D4/D5/D6 metrics.
-   - Run D7 if runtime permits, since the current Section 9 pilot skipped it.
-   - If D3/D6 do not reach held-out NMSE <=0.33 at <=1.90 average bpw, proceed
-     to a neuron-alignment research slice rather than adding more left-output
-     shared overhead.
+   - D3 is now recovered from the compact pasted summary; verify
+     `runs/run2/ablation_metrics.json` only if exact JSON provenance is needed.
+   - D6 improves over D3 by only about 0.11% relative NMSE, so do not spend
+     more effort on left-output shared overhead unless a larger run contradicts
+     this pilot.
+   - Run D7 only as a high-bpw floor check if runtime is cheap; otherwise move
+     to a neuron-alignment research slice.
    - Add compact doc hashes/lengths for the streamed 40-document pilot set.
    - Consider a larger 256/64/4096 evidence run if runtime remains acceptable.
    - Still report this as layer-local routed MoE-output MSE, not full-model KL.
