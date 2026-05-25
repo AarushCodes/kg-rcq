@@ -190,11 +190,15 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _text_config(config: Any) -> Any:
+    if isinstance(config, dict):
+        return config.get("text_config", config)
     return getattr(config, "text_config", config)
 
 
 def _getattr_any(obj: Any, names: list[str], default: Any = None) -> Any:
     for name in names:
+        if isinstance(obj, dict) and name in obj:
+            return obj[name]
         if hasattr(obj, name):
             return getattr(obj, name)
     return default
@@ -418,6 +422,11 @@ def _hf_download(model_id: str, filename: str, revision: str | None, token: str 
     return hf_hub_download(repo_id=model_id, filename=filename, revision=revision, token=token, cache_dir=cache_dir)
 
 
+def _load_config_json(model_id: str, revision: str | None, token: str | None, cache_dir: str | None) -> dict[str, Any]:
+    config_path = _hf_download(model_id, "config.json", revision, token, cache_dir)
+    return json.loads(Path(config_path).read_text(encoding="utf-8"))
+
+
 def _load_index(model_id: str, revision: str | None, token: str | None, cache_dir: str | None) -> dict[str, Any]:
     index_path = _hf_download(model_id, "model.safetensors.index.json", revision, token, cache_dir)
     return json.loads(Path(index_path).read_text(encoding="utf-8"))
@@ -511,9 +520,7 @@ def load_layer(
     layer_id: int,
     dtype: torch.dtype,
 ) -> tuple[LoadedLayer, dict[str, Any]]:
-    from transformers import AutoConfig
-
-    config = AutoConfig.from_pretrained(model_id, revision=revision, token=token, cache_dir=cache_dir)
+    config = _load_config_json(model_id, revision, token, cache_dir)
     text_config = _text_config(config)
     index = _load_index(model_id, revision, token, cache_dir)
     key_map = _required_keys(layer_id)
@@ -560,11 +567,11 @@ def load_layer(
         num_key_value_heads=num_key_value_heads,
         head_dim=head_dim,
         attention_bias=bool(_getattr_any(text_config, ["attention_bias"], False)),
-        rope_parameters=dict(_getattr_any(text_config, ["rope_parameters"], {})),
+        rope_parameters=dict(_getattr_any(text_config, ["rope_parameters", "rope_scaling"], {})),
         top_k=int(_getattr_any(text_config, ["num_experts_per_tok"], 8)),
     )
     summary = {
-        "model_type": getattr(text_config, "model_type", None),
+        "model_type": _getattr_any(text_config, ["model_type"]),
         "hidden_size": int(_getattr_any(text_config, ["hidden_size"], layer.router_weight.shape[1])),
         "moe_intermediate_size": int(_getattr_any(text_config, ["moe_intermediate_size"], intermediate)),
         "num_experts": int(_getattr_any(text_config, ["num_experts"], layer.router_weight.shape[0])),
@@ -590,9 +597,7 @@ def inspect_only(
     cache_dir: str | None,
     layer_id: int,
 ) -> dict[str, Any]:
-    from transformers import AutoConfig
-
-    config = AutoConfig.from_pretrained(model_id, revision=revision, token=token, cache_dir=cache_dir)
+    config = _load_config_json(model_id, revision, token, cache_dir)
     text_config = _text_config(config)
     index = _load_index(model_id, revision, token, cache_dir)
     key_map = _required_keys(layer_id)
@@ -604,7 +609,7 @@ def inspect_only(
         "model_id": model_id,
         "revision": revision,
         "layer_id": layer_id,
-        "model_type": getattr(text_config, "model_type", None),
+        "model_type": _getattr_any(text_config, ["model_type"]),
         "hidden_size": _getattr_any(text_config, ["hidden_size"]),
         "moe_intermediate_size": _getattr_any(text_config, ["moe_intermediate_size"]),
         "num_hidden_layers": _getattr_any(text_config, ["num_hidden_layers"]),
@@ -615,7 +620,7 @@ def inspect_only(
         "num_key_value_heads": _getattr_any(text_config, ["num_key_value_heads"]),
         "head_dim": _getattr_any(text_config, ["head_dim"]),
         "attention_bias": _getattr_any(text_config, ["attention_bias"]),
-        "rope_parameters": _getattr_any(text_config, ["rope_parameters"], {}),
+        "rope_parameters": _getattr_any(text_config, ["rope_parameters", "rope_scaling"], {}),
         "missing_required_tensors": missing,
         "required_tensor_summary": _estimate_required_bytes(index, [key for key in key_map.values() if key in index["weight_map"]]),
     }

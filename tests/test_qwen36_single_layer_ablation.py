@@ -7,7 +7,9 @@ from scripts.qwen36_single_layer_rcq_ablation import (
     LoadedLayer,
     build_q_moe,
     evaluate_docs,
+    _getattr_any,
     _rank_for_divisor,
+    _text_config,
 )
 
 
@@ -32,6 +34,16 @@ def _stats(num_experts: int, input_dim: int, rows: int, block_size: int) -> Line
 def test_rank_for_divisor_uses_at_least_one_rank() -> None:
     assert _rank_for_divisor(8, 256) == 1
     assert _rank_for_divisor(257, 256) == 2
+
+
+def test_dict_config_helpers_do_not_require_transformers_model_registration() -> None:
+    config = {"model_type": "qwen3_5_moe", "text_config": {"hidden_size": 4, "rope_parameters": {"rope_type": "default"}}}
+
+    text_config = _text_config(config)
+
+    assert _getattr_any(text_config, ["hidden_size"]) == 4
+    assert _getattr_any(text_config, ["rope_parameters"]) == {"rope_type": "default"}
+    assert _getattr_any(text_config, ["missing"], "fallback") == "fallback"
 
 
 def test_single_layer_ablation_core_runs_on_tiny_weights() -> None:
