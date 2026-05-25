@@ -167,6 +167,9 @@ Contains:
   loading tensor shards.
 - Full and pilot single-layer ablation cells for Kaggle.
 - A normal Python-cell variant for Kaggle sessions that buffer `%%bash` output.
+- A normal Python cell that recomputes only FP reference denominators and
+  annotates an existing pilot `ablation_metrics.json` with NMSE, without
+  rebuilding quantized ablations.
 - Result-bundle packaging instructions that include only compact JSON/log files,
   not model shards or Hugging Face cache contents.
 
@@ -629,6 +632,9 @@ Contains:
   Qwen3.5-MoE layer state keys, safetensors index key matching, required shard
   names, layer type schedule, and required tensor availability without loading
   tensor shards.
+- `--denominator-only` mode that rebuilds only the FP cached batches, writes
+  `nmse_denominators.json`, and can annotate an existing metrics JSON through
+  `--metrics-json` without rerunning quantized ablations.
 - Official Transformers `Qwen3_5MoeDecoderLayer` loading for the selected layer,
   including Qwen hybrid `linear_attention` on layer 0.
 - True layer-0 MoE input construction:
@@ -647,10 +653,14 @@ Contains:
   explicit `not_available` markers for unavailable production/2-bit/KBVQ and
   grouped-subspace baselines.
 - Compact outputs: `run_manifest.json`, `index_summary.json`,
-  `ablation_metrics.partial.json`, and `ablation_metrics.json`.
+  `nmse_denominators.json`, `ablation_metrics.partial.json`,
+  `ablation_metrics.json`, and, for denominator-only annotation,
+  `ablation_metrics_with_nmse.json`.
 
 Use this for pretrained layer-local routed MoE-output MSE evidence only. It
-does not report full-model KL, PPL, or downstream task quality.
+does not report full-model KL, PPL, or downstream task quality. NMSE fields are
+normalized by the FP routed MoE-output mean-square or variance for the same
+calibration/held-out split.
 
 ## `kaggle/`
 
@@ -874,6 +884,7 @@ Covers:
 - Rank divisor behavior for small and non-divisible dimensions.
 - Dict-style config helper behavior so dry-run inspection does not require
   model registration when reading raw `config.json`.
+- NMSE denominator and annotation helper behavior using cached FP outputs.
 - Tiny-weight execution of the proxy debug path.
 - Tiny-weight execution of the true layer-0 attention activation path.
 

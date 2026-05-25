@@ -312,7 +312,7 @@ uv run pytest -q
 Latest result:
 
 ```text
-67 passed
+68 passed
 ```
 
 Latest remote-worker focused test command:
@@ -397,6 +397,24 @@ with truncation only.
 Elapsed: 1987.6756 sec.
 ```
 
+Latest Kaggle T4 x2 NMSE denominator recovery:
+
+```text
+Command path: kaggle_commands.md Section 8, using
+scripts/qwen36_single_layer_rcq_ablation.py --denominator-only with the
+existing pilot ablation_metrics.json.
+Purpose: recompute only FP reference routed MoE-output denominators from the
+same layer-local activation path and streamed document policy, then annotate
+the existing metrics JSON with NMSE. It did not rebuild quantized ablations.
+Runner exit status: 0.
+Calibration FP reference:
+  count=43266048, mean=-0.0003666695, mean_square=0.0082688514,
+  variance=0.0082687169, rms=0.0909332248, max_abs=4.06640625.
+Held-out FP reference:
+  count=8517632, mean=-0.0004167252, mean_square=0.0071177397,
+  variance=0.0071175661, rms=0.0843666979, max_abs=3.466796875.
+```
+
 Latest Kaggle T4 x2 pilot held-out routed MoE-output MSE/RMSE:
 
 ```text
@@ -421,6 +439,34 @@ A4 rcq_1p90 + routed MoE-output correction:
   mse=0.0025962735, rmse=0.0509536408
 ```
 
+Latest Kaggle T4 x2 pilot held-out routed MoE-output NMSE:
+
+```text
+Denominator: held-out FP routed MoE-output mean square = 0.0071177397.
+Variance denominator gives nearly identical values because the held-out FP
+output mean is close to zero.
+
+baseline_fp_layer_local: nmse_mean_square=0, nmse_variance=0
+A0 shared + naive 1-bit residual, no Hadamard/rescue/correction:
+  nmse_mean_square=0.7155423012, nmse_variance=0.7155597595
+A1 A0 + Hadamard:
+  nmse_mean_square=0.6491850362, nmse_variance=0.6492008756
+A2 A1 + activation-weighted binary scale:
+  nmse_mean_square=0.6493233025, nmse_variance=0.6493391452
+A3 A2 + rcq_1p55 rescue:
+  nmse_mean_square=0.5308202620, nmse_variance=0.5308332133
+A3 A2 + rcq_1p75 rescue:
+  nmse_mean_square=0.4415595369, nmse_variance=0.4415703105
+A3 A2 + rcq_1p90 rescue:
+  nmse_mean_square=0.3684364524, nmse_variance=0.3684454418
+A4 rcq_1p55 + routed MoE-output correction:
+  nmse_mean_square=0.5247515120, nmse_variance=0.5247643153
+A4 rcq_1p75 + routed MoE-output correction:
+  nmse_mean_square=0.4367076224, nmse_variance=0.4367182776
+A4 rcq_1p90 + routed MoE-output correction:
+  nmse_mean_square=0.3647609506, nmse_variance=0.3647698503
+```
+
 Interpretation:
 
 ```text
@@ -428,7 +474,10 @@ This is the first pretrained Qwen3.6 RCQ evidence, but it is layer-local only.
 It is not full-model KL, PPL, or downstream quality. It shows the expected
 directional pattern on true layer-0 MoE inputs: Hadamard improves over naive
 1-bit; mixed-bit rescue gives the largest improvement; routed correction gives
-a small additional held-out improvement for each rescue setting.
+a small additional held-out improvement for each rescue setting. The held-out
+NMSE values are still high in absolute terms for layer-local output
+replacement, so these results are useful for ablation direction and debugging,
+not yet a quality claim.
 ```
 
 Latest text-token smoke command:
@@ -524,6 +573,8 @@ python3 scripts/build_text_fixture.py \
 ## Recent Commits Before This State Update
 
 ```text
+e29b008 Add NMSE reporting for Qwen layer ablations
+1a4d5ea Record Kaggle T4 Qwen layer pilot
 f68645f Resume completed ablation rows
 fcc479d Cache single-layer ablation inputs
 24b5be0 Add verbose Kaggle ablation progress logs
