@@ -184,12 +184,79 @@ class MSEAccumulator:
         self.count += delta.numel()
         self.max_abs = max(self.max_abs, float(delta.abs().max().item()))
 
-    def summary(self) -> dict[str, float]:
-        return {
+    def summary(self, reference_stats: dict[str, float] | None = None) -> dict[str, float]:
+        summary = {
             "mse": self.sse / max(1, self.count),
             "rmse": math.sqrt(self.sse / max(1, self.count)),
             "max_abs": self.max_abs,
         }
+        if reference_stats is not None:
+            _add_nmse_to_summary(summary, reference_stats)
+        return summary
+
+
+def _fp_output_stats(batches: list["CachedBatch"]) -> dict[str, float]:
+    count = 0
+    total = 0.0
+    total_square = 0.0
+    max_abs = 0.0
+    for batch in batches:
+        fp = batch.fp_output.float()
+        count += fp.numel()
+        total += float(fp.sum().item())
+        total_square += float(fp.square().sum().item())
+        max_abs = max(max_abs, float(fp.abs().max().item()))
+    mean = total / max(1, count)
+    mean_square = total_square / max(1, count)
+    return {
+        "count": float(count),
+        "mean": mean,
+        "mean_square": mean_square,
+        "variance": max(0.0, mean_square - mean * mean),
+        "rms": math.sqrt(mean_square),
+        "max_abs": max_abs,
+    }
+
+
+def _add_nmse_to_summary(summary: dict[str, float], reference_stats: dict[str, float]) -> None:
+    mse = summary.get("mse")
+    if mse is None:
+        return
+    mean_square = reference_stats.get("mean_square", 0.0)
+    variance = reference_stats.get("variance", 0.0)
+    summary["reference_mean_square"] = mean_square
+    summary["reference_variance"] = variance
+    if mean_square > 0.0:
+        summary["nmse_mean_square"] = mse / mean_square
+    if variance > 0.0:
+        summary["nmse_variance"] = mse / variance
+
+
+def _annotate_results_with_nmse(
+    results: list[dict[str, Any]],
+    reference_stats: dict[str, dict[str, float]],
+) -> list[dict[str, Any]]:
+    for row in results:
+        if not isinstance(row, dict) or row.get("status") != "ok":
+            continue
+        for split in ("calibration", "heldout"):
+            summary = row.get(split)
+            split_stats = reference_stats.get(split)
+            if isinstance(summary, dict) and split_stats is not None:
+                _add_nmse_to_summary(summary, split_stats)
+    return results
+
+
+def _annotate_metrics_payload_with_nmse(
+    payload: dict[str, Any],
+    reference_stats: dict[str, dict[str, float]],
+) -> dict[str, Any]:
+    annotated = dict(payload)
+    results = annotated.get("results")
+    if isinstance(results, list):
+        annotated["results"] = _annotate_results_with_nmse(results, reference_stats)
+    annotated["reference_stats"] = reference_stats
+    return annotated
 
 
 @dataclass
@@ -1166,6 +1233,7 @@ def evaluate_docs(
     include_shared: bool,
     activation_source: str,
     correction_fit: OnlineChannelRegression | None = None,
+    reference_stats: dict[str, float] | None = None,
 ) -> dict[str, float]:
     _log(
         f"evaluate_docs start docs={len(docs)} q_moe={'yes' if q_moe is not None else 'no'} "
@@ -1197,7 +1265,7 @@ def evaluate_docs(
                 f"elapsed_sec={time.time() - started:.1f}",
                 force=True,
             )
-    summary = acc.summary()
+    summary = acc.summary(reference_stats)
     _log(f"evaluate_docs done mse={summary['mse']:.6g} elapsed_sec={time.time() - started:.1f}", force=True)
     return summary
 
@@ -1210,6 +1278,7 @@ def evaluate_cached_batches(
     device: torch.device,
     include_shared: bool,
     correction_fit: OnlineChannelRegression | None = None,
+    reference_stats: dict[str, float] | None = None,
 ) -> dict[str, float]:
     _log(
         f"evaluate_cached_batches start batches={len(batches)} q_moe={'yes' if q_moe is not None else 'no'} "
@@ -1250,7 +1319,7 @@ def evaluate_cached_batches(
                 f"tokens={token_total} elapsed_sec={time.time() - started:.1f}",
                 force=True,
             )
-    summary = acc.summary()
+    summary = acc.summary(reference_stats)
     _log(f"evaluate_cached_batches done mse={summary['mse']:.6g} elapsed_sec={time.time() - started:.1f}", force=True)
     return summary
 
@@ -1301,6 +1370,7 @@ def _fit_routed_correction_cached(
     *,
     device: torch.device,
     include_shared: bool,
+    reference_stats: dict[str, float] | None = None,
 ) -> dict[str, float]:
     stats = OnlineChannelRegression(dim=layer.router_weight.shape[1], dtype=torch.float32, device=device)
     before = evaluate_cached_batches(
@@ -1310,11 +1380,19 @@ def _fit_routed_correction_cached(
         device=device,
         include_shared=include_shared,
         correction_fit=stats,
+        reference_stats=reference_stats,
     )
     alpha, beta = stats.solve()
     q_moe.correction_alpha = alpha
     q_moe.correction_beta = beta
-    after = evaluate_cached_batches(calib_batches, layer, q_moe, device=device, include_shared=include_shared)
+    after = evaluate_cached_batches(
+        calib_batches,
+        layer,
+        q_moe,
+        device=device,
+        include_shared=include_shared,
+        reference_stats=reference_stats,
+    )
     return {"calib_mse_before": before["mse"], "calib_mse_after": after["mse"]}
 
 
@@ -1439,6 +1517,8 @@ def run_ablation_cached(
     fit_correction: bool,
     device: torch.device,
     include_shared: bool,
+    calib_reference_stats: dict[str, float] | None = None,
+    heldout_reference_stats: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     _log(f"ablation start label={label}", force=True)
     started = time.time()
@@ -1458,9 +1538,24 @@ def run_ablation_cached(
             q_moe,
             device=device,
             include_shared=include_shared,
+            reference_stats=calib_reference_stats,
         )
-    calib = evaluate_cached_batches(calib_batches, layer, q_moe, device=device, include_shared=include_shared)
-    heldout = evaluate_cached_batches(eval_batches, layer, q_moe, device=device, include_shared=include_shared)
+    calib = evaluate_cached_batches(
+        calib_batches,
+        layer,
+        q_moe,
+        device=device,
+        include_shared=include_shared,
+        reference_stats=calib_reference_stats,
+    )
+    heldout = evaluate_cached_batches(
+        eval_batches,
+        layer,
+        q_moe,
+        device=device,
+        include_shared=include_shared,
+        reference_stats=heldout_reference_stats,
+    )
     payload = {
         "label": label,
         "status": "ok",
@@ -1513,6 +1608,16 @@ def main() -> None:
         type=Path,
         help="Read a previous partial/final metrics JSON and skip rows already completed with matching labels.",
     )
+    parser.add_argument(
+        "--denominator-only",
+        action="store_true",
+        help="Build only the FP cached batches and write NMSE denominators; optionally annotate an existing metrics JSON.",
+    )
+    parser.add_argument(
+        "--metrics-json",
+        type=Path,
+        help="Existing ablation_metrics JSON to annotate when --denominator-only is used.",
+    )
     args = parser.parse_args()
 
     global VERBOSE
@@ -1549,6 +1654,8 @@ def main() -> None:
         ),
         "include_shared_expert": args.include_shared_expert,
         "skip_completed_from": str(args.skip_completed_from) if args.skip_completed_from is not None else None,
+        "denominator_only": args.denominator_only,
+        "metrics_json": str(args.metrics_json) if args.metrics_json is not None else None,
         "secret_env_present": {
             "HF_TOKEN": bool(os.environ.get("HF_TOKEN")),
             "HUGGING_FACE_HUB_TOKEN": bool(os.environ.get("HUGGING_FACE_HUB_TOKEN")),
@@ -1629,6 +1736,33 @@ def main() -> None:
         torch.cuda.empty_cache()
     _log("released official token-mixer modules from GPU after cache build", force=True)
 
+    reference_stats = {
+        "calibration": _fp_output_stats(calib_batches),
+        "heldout": _fp_output_stats(eval_batches),
+    }
+    _write_json(args.output_dir / "nmse_denominators.json", {"status": "ok", "reference_stats": reference_stats})
+    _log(
+        "reference stats ready "
+        f"calib_mean_square={reference_stats['calibration']['mean_square']:.6g} "
+        f"heldout_mean_square={reference_stats['heldout']['mean_square']:.6g}",
+        force=True,
+    )
+    if args.denominator_only:
+        payload: dict[str, Any] = {
+            "status": "ok",
+            "elapsed_sec": time.time() - started,
+            "reference_stats": reference_stats,
+        }
+        if args.metrics_json is not None:
+            metrics = json.loads(args.metrics_json.read_text(encoding="utf-8"))
+            payload["annotated_metrics_source"] = str(args.metrics_json)
+            payload["annotated_metrics_output"] = str(args.output_dir / "ablation_metrics_with_nmse.json")
+            annotated = _annotate_metrics_payload_with_nmse(metrics, reference_stats)
+            _write_json(args.output_dir / "ablation_metrics_with_nmse.json", annotated)
+        _write_json(args.output_dir / "denominator_only.json", payload)
+        _log("denominator_only done", force=True)
+        return
+
     experiments = [
         ("baseline_fp_layer_local", None),
         ("production_quantization_baseline", "not_available"),
@@ -1690,6 +1824,7 @@ def main() -> None:
                 None,
                 device=device,
                 include_shared=args.include_shared_expert,
+                reference_stats=reference_stats["calibration"],
             )
             heldout = evaluate_cached_batches(
                 eval_batches,
@@ -1697,6 +1832,7 @@ def main() -> None:
                 None,
                 device=device,
                 include_shared=args.include_shared_expert,
+                reference_stats=reference_stats["heldout"],
             )
             results.append({"label": label, "status": "ok", "calibration": calib, "heldout": heldout})
         elif spec == "not_available":
@@ -1713,14 +1849,24 @@ def main() -> None:
                     stats,
                     device=device,
                     include_shared=args.include_shared_expert,
+                    calib_reference_stats=reference_stats["calibration"],
+                    heldout_reference_stats=reference_stats["heldout"],
                     **spec,
                 )
             )
+            _annotate_results_with_nmse(results, reference_stats)
             _write_json(
                 args.output_dir / "ablation_metrics.partial.json",
-                {"status": "running", "completed": len(results), "results": results, "elapsed_sec": time.time() - started},
+                {
+                    "status": "running",
+                    "completed": len(results),
+                    "reference_stats": reference_stats,
+                    "results": results,
+                    "elapsed_sec": time.time() - started,
+                },
             )
 
+    _annotate_results_with_nmse(results, reference_stats)
     _write_json(
         args.output_dir / "ablation_metrics.json",
         {
@@ -1734,6 +1880,7 @@ def main() -> None:
             },
             "activation_source": manifest["activation_source"],
             "activation_source_detail": manifest["activation_source_detail"],
+            "reference_stats": reference_stats,
             "results": results,
         },
     )

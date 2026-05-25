@@ -553,3 +553,155 @@ run(
   ls -lh qwen36_single_layer_rcq_pilot_outputs.tgz"""
 )
 ```
+
+## 8. Add NMSE To Existing Pilot Metrics
+
+Use this after a pilot run has already produced:
+
+```text
+/kaggle/working/outputs/qwen36_single_layer_rcq_pilot/ablation_metrics.json
+```
+
+This does not rebuild quantized ablations. It reloads the same layer, streams
+the same raw documents, recomputes only the full-precision reference MoE-output
+energy for calibration and held-out splits, then writes an annotated metrics
+file with `nmse_mean_square` and `nmse_variance`.
+
+Paste this into a normal Kaggle Python cell.
+
+```python
+import os
+import subprocess
+import time
+from pathlib import Path
+
+
+def run(cmd, cwd=None, check=True):
+    print(f"\n=== $ {cmd} ===", flush=True)
+    result = subprocess.run(
+        cmd,
+        shell=True,
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    print(result.stdout, flush=True)
+    if check and result.returncode != 0:
+        raise RuntimeError(f"command failed: {cmd}")
+    return result
+
+
+RCQ_REPO_URL = "https://github.com/AarushCodes/rcq.git"
+RCQ_ROOT = Path("/kaggle/working/rcq")
+HF_HOME = Path("/kaggle/working/hf_cache")
+SOURCE_METRICS = Path("/kaggle/working/outputs/qwen36_single_layer_rcq_pilot/ablation_metrics.json")
+RCQ_OUT = Path("/kaggle/working/outputs/qwen36_single_layer_rcq_pilot_nmse")
+RCQ_LOG_DIR = Path("/kaggle/working/rcq_logs")
+
+if not SOURCE_METRICS.exists():
+    raise FileNotFoundError(f"missing existing metrics JSON: {SOURCE_METRICS}")
+
+for path in [HF_HOME, RCQ_OUT.parent, RCQ_LOG_DIR]:
+    path.mkdir(parents=True, exist_ok=True)
+
+os.environ["HF_HOME"] = str(HF_HOME)
+os.environ["TRANSFORMERS_CACHE"] = str(HF_HOME)
+
+print("=== selected commit ===", flush=True)
+commit = run(f"git ls-remote {RCQ_REPO_URL} refs/heads/main").stdout.split()[0]
+print(commit, flush=True)
+
+print("=== clone repo ===", flush=True)
+run(f"rm -rf {RCQ_ROOT}")
+run(f"git clone {RCQ_REPO_URL} {RCQ_ROOT}")
+run(f"git checkout {commit}", cwd=RCQ_ROOT)
+run("git rev-parse HEAD", cwd=RCQ_ROOT)
+
+print("=== ensure qwen3.5 moe transformers support ===", flush=True)
+run('python -m pip install -U "transformers>=5.9.0,<6"', cwd=RCQ_ROOT)
+run(
+    """python - <<'PY'
+import transformers
+print("transformers", transformers.__version__)
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeDecoderLayer
+print("qwen3_5_moe_decoder_layer_import", Qwen3_5MoeDecoderLayer.__name__)
+PY""",
+    cwd=RCQ_ROOT,
+)
+
+runner_log = RCQ_LOG_DIR / "qwen36_single_layer_rcq_pilot_nmse.runner.log"
+cmd = f"""
+PYTHONUNBUFFERED=1 PYTHONPATH={RCQ_ROOT} python -u scripts/qwen36_single_layer_rcq_ablation.py \
+  --model-id Qwen/Qwen3.6-35B-A3B \
+  --layer-id 0 \
+  --calib-docs 32 \
+  --eval-docs 8 \
+  --max-tokens-per-doc 1024 \
+  --activation-source true_layer0_post_attention_norm \
+  --denominator-only \
+  --metrics-json {SOURCE_METRICS} \
+  --verbose \
+  --output-dir {RCQ_OUT} \
+  --cache-dir {HF_HOME}
+"""
+
+print("=== compute NMSE denominators only ===", flush=True)
+with open(runner_log, "w", encoding="utf-8") as log:
+    proc = subprocess.Popen(
+        cmd,
+        shell=True,
+        cwd=RCQ_ROOT,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+last_size = 0
+while proc.poll() is None:
+    time.sleep(20)
+    if runner_log.exists():
+        text = runner_log.read_text(errors="replace")
+        print(text[last_size:], end="", flush=True)
+        last_size = len(text)
+    print(f"\n=== still running {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} ===", flush=True)
+
+text = runner_log.read_text(errors="replace") if runner_log.exists() else ""
+print(text[last_size:], end="", flush=True)
+print(f"\nrunner_exit_status={proc.returncode}", flush=True)
+if proc.returncode != 0:
+    raise RuntimeError("runner failed")
+
+print("=== compact NMSE summary ===", flush=True)
+run(
+    f"""python - <<'PY'
+import json
+p = "{RCQ_OUT}/ablation_metrics_with_nmse.json"
+d = json.load(open(p))
+print("status", d["status"])
+print("reference_stats", d["reference_stats"])
+for row in d["results"]:
+    if row["status"] != "ok":
+        print(row["label"], row["status"], row.get("reason"))
+        continue
+    held = row.get("heldout", {{}})
+    print(
+        row["label"],
+        "heldout_mse", held.get("mse"),
+        "heldout_nmse_mean_square", held.get("nmse_mean_square"),
+        "heldout_nmse_variance", held.get("nmse_variance"),
+    )
+PY"""
+)
+
+print("=== package NMSE results ===", flush=True)
+run(
+    """cd /kaggle/working && tar -czf qwen36_single_layer_rcq_pilot_nmse_outputs.tgz \
+  outputs/qwen36_single_layer_rcq_pilot_nmse/run_manifest.json \
+  outputs/qwen36_single_layer_rcq_pilot_nmse/index_summary.json \
+  outputs/qwen36_single_layer_rcq_pilot_nmse/nmse_denominators.json \
+  outputs/qwen36_single_layer_rcq_pilot_nmse/ablation_metrics_with_nmse.json \
+  rcq_logs/qwen36_single_layer_rcq_pilot_nmse.runner.log && \
+  ls -lh qwen36_single_layer_rcq_pilot_nmse_outputs.tgz"""
+)
+```

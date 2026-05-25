@@ -4,7 +4,10 @@ import torch
 
 from rcq_moe.stats import LinearCalibrationStats
 from scripts.qwen36_single_layer_rcq_ablation import (
+    CachedBatch,
     LoadedLayer,
+    _add_nmse_to_summary,
+    _fp_output_stats,
     build_q_moe,
     evaluate_docs,
     _getattr_any,
@@ -44,6 +47,26 @@ def test_dict_config_helpers_do_not_require_transformers_model_registration() ->
     assert _getattr_any(text_config, ["hidden_size"]) == 4
     assert _getattr_any(text_config, ["rope_parameters"]) == {"rope_type": "default"}
     assert _getattr_any(text_config, ["missing"], "fallback") == "fallback"
+
+
+def test_nmse_denominator_helpers_use_cached_fp_outputs() -> None:
+    batches = [
+        CachedBatch(
+            hidden=torch.zeros(2, 3),
+            router_weights=torch.ones(2, 1),
+            selected_experts=torch.zeros(2, 1, dtype=torch.long),
+            fp_output=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+        )
+    ]
+
+    stats = _fp_output_stats(batches)
+    summary = {"mse": 2.5, "rmse": 2.5**0.5, "max_abs": 2.0}
+    _add_nmse_to_summary(summary, stats)
+
+    assert stats["mean_square"] == 7.5
+    assert stats["variance"] == 1.25
+    assert summary["nmse_mean_square"] == 2.5 / 7.5
+    assert summary["nmse_variance"] == 2.0
 
 
 def test_single_layer_ablation_core_runs_on_tiny_weights() -> None:
