@@ -13,6 +13,7 @@ import gc
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -40,13 +41,59 @@ class ModuleSummary:
     parameter_count: int
 
 
-def _run_command(argv: list[str]) -> str:
+def _command_snapshot(argv: list[str], *, timeout_sec: float = 20.0, max_output_chars: int = 12_000) -> dict[str, Any]:
+    executable = shutil.which(argv[0])
+    if executable is None:
+        return {
+            "argv": argv,
+            "available": False,
+            "path": None,
+            "returncode": None,
+            "timed_out": False,
+            "output": f"{argv[0]} not found",
+            "output_truncated": False,
+        }
+
     try:
-        result = subprocess.run(argv, check=False, capture_output=True, text=True)
-    except FileNotFoundError:
-        return f"{argv[0]} not found"
+        result = subprocess.run(
+            argv,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        output = (stdout + stderr).strip()
+        return {
+            "argv": argv,
+            "available": True,
+            "path": executable,
+            "returncode": None,
+            "timed_out": True,
+            "output": _truncate_output(output or f"{argv[0]} timed out after {timeout_sec:g}s", max_output_chars),
+            "output_truncated": len(output) > max_output_chars,
+        }
+
     output = (result.stdout + result.stderr).strip()
-    return output if output else f"{argv[0]} exited with code {result.returncode}"
+    if not output:
+        output = f"{argv[0]} exited with code {result.returncode}"
+    return {
+        "argv": argv,
+        "available": True,
+        "path": executable,
+        "returncode": result.returncode,
+        "timed_out": False,
+        "output": _truncate_output(output, max_output_chars),
+        "output_truncated": len(output) > max_output_chars,
+    }
+
+
+def _truncate_output(output: str, max_chars: int) -> str:
+    if len(output) <= max_chars:
+        return output
+    return output[:max_chars] + f"\n... truncated {len(output) - max_chars} chars"
 
 
 def _torch_dtype(name: str) -> torch.dtype:
@@ -59,6 +106,30 @@ def _torch_dtype(name: str) -> torch.dtype:
     if name not in mapping:
         raise ValueError(f"unsupported dtype {name!r}")
     return mapping[name]  # type: ignore[return-value]
+
+
+def _runtime_snapshot() -> dict[str, Any]:
+    nvidia_smi = _command_snapshot(["nvidia-smi"])
+    rocm_smi = _command_snapshot(["rocm-smi"])
+    rocminfo = _command_snapshot(["rocminfo"], max_output_chars=20_000)
+    torch_hip = getattr(torch.version, "hip", None)
+    rocm_tooling_present = bool(rocm_smi["available"] or rocminfo["available"])
+
+    notes = []
+    if torch_hip and not nvidia_smi["available"]:
+        notes.append("nvidia-smi unavailable; this is expected on ROCm-only hosts")
+
+    return {
+        "torch_version": torch.__version__,
+        "torch_cuda_version": getattr(torch.version, "cuda", None),
+        "torch_hip_version": torch_hip,
+        "cuda": _gpu_snapshot(),
+        "rocm_tooling_present": rocm_tooling_present,
+        "rocm_smi": rocm_smi,
+        "rocminfo": rocminfo,
+        "nvidia_smi": nvidia_smi,
+        "notes": notes,
+    }
 
 
 def _load_texts(calib_text_file: Path | None, eval_text_file: Path | None) -> tuple[list[str], list[str], str]:
@@ -157,14 +228,18 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     started = time.time()
 
+    runtime = _runtime_snapshot()
     env_payload: dict[str, Any] = {
         "argv": sys.argv,
         "cwd": str(Path.cwd()),
         "python": sys.version,
         "platform": platform.platform(),
         "torch": torch.__version__,
-        "cuda": _gpu_snapshot(),
-        "nvidia_smi": _run_command(["nvidia-smi"]),
+        "cuda": runtime["cuda"],
+        "nvidia_smi": runtime["nvidia_smi"],
+        "rocm_smi": runtime["rocm_smi"],
+        "rocminfo": runtime["rocminfo"],
+        "runtime": runtime,
         "model_id": args.model_id,
         "revision": args.revision,
         "dry_run": args.dry_run,

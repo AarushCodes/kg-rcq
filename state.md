@@ -11,8 +11,10 @@ script and notebook runners for a competition-attached Qwen3.6 FP-only smoke
 slice, plus a local one-shot Kaggle remote-control worker driven by reviewed
 JSON job specs. The active pretrained-compatible validation plan is now moving
 from Kaggle to a single AMD MI300X remote host with SSH, exact git commit
-checkout, remote-only model caches, and small local result pulls. The repository
-now has a public-facing `README.MD` copied from the current README draft.
+checkout, remote-only model caches, and small local result pulls. The FP smoke
+script now records ROCm-aware runtime metadata needed for the first MI300X
+control-plane dry-run. The repository now has a public-facing `README.MD`
+copied from the current README draft.
 
 This is still a research/plumbing prototype:
 
@@ -176,6 +178,15 @@ This is still a research/plumbing prototype:
   - Pauses Kaggle as a backend rather than deleting the existing Kaggle worker,
     notebook, and job-spec code.
 
+- MI300X ROCm-aware FP smoke metadata:
+  - Updates `scripts/qwen36_fp_smoke.py` dry-run metadata to include
+    `torch.version.hip`, `torch.version.cuda`, PyTorch device discovery through
+    `torch.cuda`, bounded `nvidia-smi`, `rocm-smi`, and `rocminfo` command
+    snapshots, and a `rocm_tooling_present` flag.
+  - Keeps local CPU dry-runs and CUDA hosts compatible while making missing
+    `nvidia-smi` informational on ROCm-only hosts.
+  - Adds test coverage through the local `control_plane_smoke` dry-run action.
+
 - Public README:
   - Adds `README.MD`, synced from `readme_draft.md`.
   - Summarizes RCQ-MoE motivation, research goals, compression recipe,
@@ -229,6 +240,10 @@ Latest Qwen3.6 FP smoke dry-run result:
 
 ```text
 metadata.json, module_structure.txt, and fp_metrics.json written successfully.
+metadata.json now includes top-level cuda/nvidia_smi/rocm_smi/rocminfo fields
+and a nested runtime block with torch_hip_version, torch_cuda_version,
+rocm_tooling_present, bounded rocm-smi, bounded rocminfo, and bounded
+nvidia-smi probe snapshots.
 No pretrained model weights were loaded locally.
 No Kaggle command was run.
 ```
@@ -330,6 +345,15 @@ Added docs/specs/2026-05-25-mi300x-remote-workflow-design.md and updated
 state/structure to make MI300X the active remote validation path. No SSH command
 was run, no remote access was used, and no pretrained model weights were loaded.
 No tests were run because this was a documentation-only slice.
+```
+
+Latest MI300X metadata slice:
+
+```text
+Patched scripts/qwen36_fp_smoke.py to record ROCm-aware runtime metadata for
+MI300X dry-runs while preserving CUDA/local CPU compatibility. The local dry-run
+completed without loading pretrained model weights. No SSH command was run and
+no remote access was used.
 ```
 
 Latest text-token smoke command:
@@ -451,8 +475,9 @@ e872141 Add streamed text fixture builder
   RTX PRO 6000, so it is not the desired validation path for Slice 3.
 - The manually created RTX PRO 6000 Kaggle notebook currently has internet
   disabled, so the GitHub-clone worker path cannot run there as-is.
-- The MI300X path is designed but not yet executed; no SSH alias, remote
-  PyTorch/ROCm metadata, or remote dry-run output has been recorded yet.
+- The MI300X path is designed and the FP smoke script is ROCm-metadata-ready,
+  but it has not yet been executed over SSH; no SSH alias, remote PyTorch/ROCm
+  metadata, or remote dry-run output has been recorded yet.
 - No completed Kaggle Qwen3.6 FP smoke outputs have been pulled or interpreted.
 - Current artifact stores fake-dequant reference tensors, not packed bitstreams.
 - No FP8 scale/shared-factor storage.
@@ -465,26 +490,20 @@ e872141 Add streamed text fixture builder
 
 Continue the pretrained-compatible MI300X path slice by slice:
 
-1. ROCm-aware FP smoke metadata.
-   - Patch `scripts/qwen36_fp_smoke.py` to record `torch.version.hip`,
-     `rocm-smi`, `rocminfo`, and device metadata without treating missing
-     `nvidia-smi` as a problem on ROCm.
-   - Keep the script compatible with CUDA and local CPU dry-runs.
-   - Run local tests.
-2. MI300X control-plane smoke.
+1. MI300X control-plane smoke.
    - Use SSH to run `scripts/qwen36_fp_smoke.py --dry-run` from an exact pinned
      commit on the MI300X host.
    - Verify PyTorch, ROCm, GPU visibility, repo checkout, imports, and small
      output writing.
    - Do not load Qwen weights in this slice.
-3. MI300X Qwen3.6 FP-only smoke.
+2. MI300X Qwen3.6 FP-only smoke.
    - Load `Qwen/Qwen3.6-35B-A3B` on MI300X, not locally.
    - Use the remote Hugging Face cache under the MI300X workspace.
    - Run tokenizer-driven FP-only eval and inspect/capture sparse MoE block
      structure under the remote output directory.
    - Pull only compact JSON/text/log outputs back to local.
    - Do not quantize in this slice.
-4. One-layer pretrained RCQ conversion.
+3. One-layer pretrained RCQ conversion.
    - Add layer-limited conversion if needed.
    - Quantize exactly one Qwen3.6 MoE layer/block first on MI300X.
    - Report FP-vs-one-layer-RCQ KL, routed MoE MSE before/after correction,

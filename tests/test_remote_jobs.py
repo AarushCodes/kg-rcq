@@ -161,6 +161,12 @@ def test_run_action_executes_local_dry_run(tmp_path: Path) -> None:
 
     assert result.returncode == 0
     assert (output_dir / "metadata.json").exists()
+    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["runtime"]["torch_hip_version"] is None or isinstance(metadata["runtime"]["torch_hip_version"], str)
+    assert "rocm_tooling_present" in metadata["runtime"]
+    assert metadata["runtime"]["nvidia_smi"]["available"] in {True, False}
+    assert metadata["runtime"]["rocm_smi"]["available"] in {True, False}
+    assert metadata["runtime"]["rocminfo"]["available"] in {True, False}
     assert (output_dir / "module_structure.txt").read_text(encoding="utf-8") == "dry_run=true\n"
     assert (output_dir / "stdout.log").exists()
     assert (output_dir / "stderr.log").exists()

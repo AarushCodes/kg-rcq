@@ -570,7 +570,8 @@ Use this as the fastest end-to-end official-Qwen conversion metric script.
 ### `scripts/qwen36_fp_smoke.py`
 
 FP-only pretrained Qwen3.6 smoke runner intended for remote GPU environments,
-especially the competition-attached Kaggle RTX PRO 6000 path.
+especially the active SSH-based MI300X path and the paused Kaggle RTX PRO 6000
+path.
 
 Contains:
 
@@ -578,6 +579,9 @@ Contains:
   files, sequence length, and eval batch shape.
 - `--dry-run` mode that writes environment metadata without loading model
   weights.
+- ROCm/CUDA-aware runtime metadata, including `torch.version.hip`, PyTorch
+  device discovery through `torch.cuda`, bounded `nvidia-smi`, `rocm-smi`, and
+  `rocminfo` snapshots, and a `rocm_tooling_present` flag.
 - Hugging Face tokenizer/model loading with optional `HF_TOKEN`.
 - Tiny next-token loss pass using tokenizer-backed `TextTokenBatch`.
 - MoE/router/expert module structure inspection.
@@ -814,6 +818,7 @@ Covers:
 - Invalid commit and param value rejection.
 - Output-root containment checks.
 - Local `control_plane_smoke` dry-run execution through `run_action(...)`.
+- ROCm-aware metadata keys written by the local dry-run.
 - Checked-in job template validation.
 
 ### `tests/test_text_data.py`
