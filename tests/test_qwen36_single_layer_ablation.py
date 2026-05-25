@@ -1,0 +1,154 @@
+from __future__ import annotations
+
+import torch
+
+from rcq_moe.stats import LinearCalibrationStats
+from scripts.qwen36_single_layer_rcq_ablation import (
+    LoadedLayer,
+    build_q_moe,
+    evaluate_docs,
+    _rank_for_divisor,
+)
+
+
+class TinyTokenizer:
+    eos_token_id = 1
+
+    def __call__(self, text: str, **kwargs):
+        max_length = kwargs["max_length"]
+        ids = [max(1, (ord(ch) % 15) + 1) for ch in text][:max_length]
+        return {"input_ids": torch.tensor([ids], dtype=torch.long)}
+
+
+def _stats(num_experts: int, input_dim: int, rows: int, block_size: int) -> LinearCalibrationStats:
+    blocks = (input_dim + block_size - 1) // block_size
+    return LinearCalibrationStats(
+        covariance=torch.eye(input_dim),
+        expert_importance=torch.full((num_experts,), 1.0 / num_experts),
+        rotated_second_moments=torch.ones(blocks, block_size),
+    )
+
+
+def test_rank_for_divisor_uses_at_least_one_rank() -> None:
+    assert _rank_for_divisor(8, 256) == 1
+    assert _rank_for_divisor(257, 256) == 2
+
+
+def test_single_layer_ablation_core_runs_on_tiny_weights() -> None:
+    torch.manual_seed(0)
+    num_experts = 2
+    hidden = 8
+    intermediate = 6
+    vocab = 24
+    block = 4
+    layer = LoadedLayer(
+        embed_tokens=torch.randn(vocab, hidden),
+        input_norm_weight=torch.zeros(hidden),
+        post_attention_norm_weight=torch.zeros(hidden),
+        q_proj_weight=torch.randn(2 * hidden, hidden),
+        q_proj_bias=None,
+        k_proj_weight=torch.randn(hidden, hidden),
+        k_proj_bias=None,
+        v_proj_weight=torch.randn(hidden, hidden),
+        v_proj_bias=None,
+        o_proj_weight=torch.randn(hidden, hidden),
+        o_proj_bias=None,
+        q_norm_weight=torch.zeros(hidden),
+        k_norm_weight=torch.zeros(hidden),
+        router_weight=torch.randn(num_experts, hidden),
+        gate_weight=torch.randn(num_experts, intermediate, hidden),
+        up_weight=torch.randn(num_experts, intermediate, hidden),
+        down_weight=torch.randn(num_experts, hidden, intermediate),
+        shared_gate_weight=torch.randn(intermediate, hidden),
+        shared_up_weight=torch.randn(intermediate, hidden),
+        shared_down_weight=torch.randn(hidden, intermediate),
+        shared_expert_gate_weight=torch.randn(1, hidden),
+        hidden_act="silu",
+        rms_norm_eps=1e-6,
+        layer_type="full_attention",
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=hidden,
+        attention_bias=False,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 1.0},
+        top_k=1,
+    )
+    stats = {
+        "gate": _stats(num_experts, hidden, intermediate, block),
+        "up": _stats(num_experts, hidden, intermediate, block),
+        "down": _stats(num_experts, intermediate, hidden, block),
+    }
+
+    q_moe = build_q_moe(
+        layer,
+        stats,
+        rank_divisor=256,
+        use_hadamard=True,
+        weighted_scale=True,
+        rescue_config=None,
+    )
+    summary = evaluate_docs(
+        ["abc def"],
+        TinyTokenizer(),
+        layer,
+        q_moe,
+        max_tokens_per_doc=8,
+        device=torch.device("cpu"),
+        include_shared=False,
+        activation_source="proxy_embedding_norm",
+    )
+
+    assert summary["mse"] >= 0.0
+    assert summary["rmse"] >= 0.0
+    assert summary["max_abs"] >= 0.0
+
+
+def test_true_layer0_attention_activation_path_runs_on_tiny_weights() -> None:
+    torch.manual_seed(1)
+    hidden = 8
+    intermediate = 6
+    layer = LoadedLayer(
+        embed_tokens=torch.randn(24, hidden),
+        input_norm_weight=torch.zeros(hidden),
+        post_attention_norm_weight=torch.zeros(hidden),
+        q_proj_weight=torch.randn(2 * hidden, hidden),
+        q_proj_bias=None,
+        k_proj_weight=torch.randn(hidden, hidden),
+        k_proj_bias=None,
+        v_proj_weight=torch.randn(hidden, hidden),
+        v_proj_bias=None,
+        o_proj_weight=torch.randn(hidden, hidden),
+        o_proj_bias=None,
+        q_norm_weight=torch.zeros(hidden),
+        k_norm_weight=torch.zeros(hidden),
+        router_weight=torch.randn(2, hidden),
+        gate_weight=torch.randn(2, intermediate, hidden),
+        up_weight=torch.randn(2, intermediate, hidden),
+        down_weight=torch.randn(2, hidden, intermediate),
+        shared_gate_weight=torch.randn(intermediate, hidden),
+        shared_up_weight=torch.randn(intermediate, hidden),
+        shared_down_weight=torch.randn(hidden, intermediate),
+        shared_expert_gate_weight=torch.randn(1, hidden),
+        hidden_act="silu",
+        rms_norm_eps=1e-6,
+        layer_type="full_attention",
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=hidden,
+        attention_bias=False,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 1.0},
+        top_k=1,
+    )
+
+    summary = evaluate_docs(
+        ["proper attention path"],
+        TinyTokenizer(),
+        layer,
+        None,
+        max_tokens_per_doc=8,
+        device=torch.device("cpu"),
+        include_shared=True,
+        activation_source="true_layer0_post_attention_norm",
+    )
+
+    assert summary == {"mse": 0.0, "rmse": 0.0, "max_abs": 0.0}
