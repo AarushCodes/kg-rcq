@@ -705,3 +705,271 @@ run(
   ls -lh qwen36_single_layer_rcq_pilot_nmse_outputs.tgz"""
 )
 ```
+
+## 9. Down V2 Time-To-Insight Ablation Cell
+
+Use this after the local `down left-output` implementation is pushed to GitHub.
+This cell is optimized for the next decision, not for exhaustive reporting:
+
+```text
+Primary question:
+  Do down mode none / left_output beat the old D0 baseline enough to justify
+  the projection-specific path?
+
+Recommended first run:
+  D0, D3, D4, D5, D6
+
+Optional high-quality row:
+  D7
+```
+
+Why this is efficient:
+
+- It creates a resume JSON that marks all old A0/A1/A2/A3/A4/rank rows as
+  already handled, so the runner skips them.
+- It runs only the Down V2 rows needed for the immediate decision.
+- It still uses the normal cached true layer-0 activation path, denominator
+  computation, partial-result resume, and compact packaging.
+- D5/D6 use sequential down stats: quantized gate/up first, then collect down
+  moments and output covariance from `activation(gate_Q) * up_Q`.
+
+Paste this into a normal Kaggle Python cell.
+
+```python
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+
+
+def run(cmd, cwd=None, check=True):
+    print(f"\n=== $ {cmd} ===", flush=True)
+    result = subprocess.run(
+        cmd,
+        shell=True,
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    print(result.stdout, flush=True)
+    if check and result.returncode != 0:
+        raise RuntimeError(f"command failed: {cmd}")
+    return result
+
+
+RCQ_REPO_URL = "https://github.com/AarushCodes/rcq.git"
+RCQ_ROOT = Path("/kaggle/working/rcq")
+HF_HOME = Path("/kaggle/working/hf_cache")
+RCQ_OUT = Path("/kaggle/working/outputs/qwen36_down_v2_pilot")
+RCQ_LOG_DIR = Path("/kaggle/working/rcq_logs")
+
+# Use the exact reviewed local commit after it has been pushed. Set to None to
+# use current GitHub main.
+PIN_COMMIT = "65d1ebf867a38257412d1a6b8efd7a9856d70014"
+
+# Best first pass. Add D7 if there is enough time and you want the quality
+# reference row in the same run.
+RUN_LABELS = {
+    "D0_current_baseline_legacy_right_rcq_1p75_correction",
+    "D3_gate_up_1p55_down_none_min2_5p4_correction",
+    "D4_gate_up_1p55_down_none_min2_20p4_correction",
+    "D5_gate_up_1p55_down_left_output_mix_1bit",
+    "D6_gate_up_1p55_down_left_output_min2_5p4",
+    # "D7_gate_up_1p75_down_left_output_min2_20p4",
+}
+
+ALL_LABELS = [
+    "baseline_fp_layer_local",
+    "production_quantization_baseline",
+    "two_bit_expert_quantization_baseline",
+    "kbvq_like_baseline",
+    "A0_shared_naive_1bit_no_hadamard_no_rescue_no_correction",
+    "A1_shared_hadamard_1bit_no_rescue_no_correction",
+    "A2_A1_activation_weighted_binary_scale",
+    "A3_A2_mixed_bit_rescue_rcq_1p55",
+    "A3_A2_mixed_bit_rescue_rcq_1p75",
+    "A3_A2_mixed_bit_rescue_rcq_1p90",
+    "A4_A3_rcq_1p55_routed_moe_output_correction",
+    "A4_A3_rcq_1p75_routed_moe_output_correction",
+    "A4_A3_rcq_1p90_routed_moe_output_correction",
+    "router_weighted_covariance_A4_rcq_1p75",
+    "unweighted_covariance_A4_rcq_1p75",
+    "rank_n_over_256_A4_rcq_1p75",
+    "rank_n_over_128_A4_rcq_1p75",
+    "rank_n_over_64_A4_rcq_1p75",
+    "grouped_subspaces_G1_G2_G4_G8",
+    "per_linear_output_affine_correction",
+    "D0_current_baseline_legacy_right_rcq_1p75_correction",
+    "D1_gate_up_quantized_down_fp",
+    "D2_down_quantized_gate_up_fp",
+    "D3_gate_up_1p55_down_none_min2_5p4_correction",
+    "D4_gate_up_1p55_down_none_min2_20p4_correction",
+    "D5_gate_up_1p55_down_left_output_mix_1bit",
+    "D6_gate_up_1p55_down_left_output_min2_5p4",
+    "D7_gate_up_1p75_down_left_output_min2_20p4",
+]
+
+for path in [HF_HOME, RCQ_OUT, RCQ_LOG_DIR]:
+    path.mkdir(parents=True, exist_ok=True)
+
+os.environ["HF_HOME"] = str(HF_HOME)
+os.environ["TRANSFORMERS_CACHE"] = str(HF_HOME)
+
+print("=== selected commit ===", flush=True)
+if PIN_COMMIT is None:
+    commit = run(f"git ls-remote {RCQ_REPO_URL} refs/heads/main").stdout.split()[0]
+else:
+    commit = PIN_COMMIT
+print(commit, flush=True)
+
+print("=== gpu ===", flush=True)
+run("nvidia-smi", check=False)
+
+print("=== clone repo ===", flush=True)
+run(f"rm -rf {RCQ_ROOT}")
+run(f"git clone {RCQ_REPO_URL} {RCQ_ROOT}")
+run(f"git checkout {commit}", cwd=RCQ_ROOT)
+run("git rev-parse HEAD", cwd=RCQ_ROOT)
+
+print("=== ensure qwen3.5 moe transformers support ===", flush=True)
+run('python -m pip install -U "transformers>=5.9.0,<6"', cwd=RCQ_ROOT)
+run(
+    """python - <<'PY'
+import transformers
+print("transformers", transformers.__version__)
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeDecoderLayer
+print("qwen3_5_moe_decoder_layer_import", Qwen3_5MoeDecoderLayer.__name__)
+PY""",
+    cwd=RCQ_ROOT,
+)
+
+skip_file = RCQ_OUT / "skip_non_down_v2_rows.json"
+skip_rows = [
+    {
+        "label": label,
+        "status": "not_available",
+        "reason": "intentionally skipped by Section 9 time-to-insight Down V2 cell",
+    }
+    for label in ALL_LABELS
+    if label not in RUN_LABELS
+]
+skip_file.write_text(json.dumps({"results": skip_rows}, indent=2) + "\n", encoding="utf-8")
+print("=== run labels ===", flush=True)
+print("\n".join(sorted(RUN_LABELS)), flush=True)
+print(f"skip_file={skip_file}", flush=True)
+
+runner_log = RCQ_LOG_DIR / "qwen36_down_v2_pilot.runner.log"
+partial_file = RCQ_OUT / "ablation_metrics.partial.json"
+resume_source = partial_file if partial_file.exists() else skip_file
+if partial_file.exists():
+    print(f"=== resume existing partial results from {partial_file} ===", flush=True)
+
+cmd = f"""
+PYTHONUNBUFFERED=1 PYTHONPATH={RCQ_ROOT} python -u scripts/qwen36_single_layer_rcq_ablation.py \
+  --model-id Qwen/Qwen3.6-35B-A3B \
+  --layer-id 0 \
+  --calib-docs 32 \
+  --eval-docs 8 \
+  --max-tokens-per-doc 1024 \
+  --activation-source true_layer0_post_attention_norm \
+  --max-experiments 28 \
+  --skip-completed-from {resume_source} \
+  --verbose \
+  --output-dir {RCQ_OUT} \
+  --cache-dir {HF_HOME}
+"""
+
+print("=== run Down V2 pilot ablations ===", flush=True)
+with open(runner_log, "w", encoding="utf-8") as log:
+    proc = subprocess.Popen(
+        cmd,
+        shell=True,
+        cwd=RCQ_ROOT,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+last_size = 0
+while proc.poll() is None:
+    time.sleep(20)
+    if runner_log.exists():
+        text = runner_log.read_text(errors="replace")
+        print(text[last_size:], end="", flush=True)
+        last_size = len(text)
+    print(f"\n=== still running {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} ===", flush=True)
+
+text = runner_log.read_text(errors="replace") if runner_log.exists() else ""
+print(text[last_size:], end="", flush=True)
+print(f"\nrunner_exit_status={proc.returncode}", flush=True)
+if proc.returncode != 0:
+    raise RuntimeError("runner failed")
+
+print("=== compact Down V2 summary ===", flush=True)
+run(
+    f"""python - <<'PY'
+import json
+p = "{RCQ_OUT}/ablation_metrics.json"
+d = json.load(open(p))
+print("status", d["status"])
+print("elapsed_sec", d["elapsed_sec"])
+print("reference_stats", d["reference_stats"])
+interesting = {{
+    "D0_current_baseline_legacy_right_rcq_1p75_correction",
+    "D3_gate_up_1p55_down_none_min2_5p4_correction",
+    "D4_gate_up_1p55_down_none_min2_20p4_correction",
+    "D5_gate_up_1p55_down_left_output_mix_1bit",
+    "D6_gate_up_1p55_down_left_output_min2_5p4",
+    "D7_gate_up_1p75_down_left_output_min2_20p4",
+}}
+for row in d["results"]:
+    if row["label"] not in interesting:
+        continue
+    if row["status"] != "ok":
+        print(row["label"], row["status"], row.get("reason"))
+        continue
+    held = row.get("heldout", {{}})
+    diag = row.get("diagnostics", {{}})
+    down = diag.get("down", {{}})
+    print(
+        row["label"],
+        "avg_bpw", row.get("average_expert_bpw"),
+        "gate_bpw", row.get("gate_bpw"),
+        "up_bpw", row.get("up_bpw"),
+        "down_bpw", row.get("down_bpw"),
+        "heldout_mse", held.get("mse"),
+        "heldout_nmse", held.get("nmse_mean_square"),
+        "down_mode", row.get("down_shared_mode"),
+        "down_cfg", row.get("down_residual_config"),
+        "down_left_cap", row.get("down_left_output_captured_energy"),
+        "down_legacy_cap", row.get("down_legacy_right_captured_energy"),
+        "down_widths", down.get("width_percentages"),
+    )
+PY"""
+)
+
+print("=== package compact Down V2 results ===", flush=True)
+run(
+    """cd /kaggle/working && tar -czf qwen36_down_v2_pilot_outputs.tgz \
+  outputs/qwen36_down_v2_pilot/run_manifest.json \
+  outputs/qwen36_down_v2_pilot/index_summary.json \
+  outputs/qwen36_down_v2_pilot/nmse_denominators.json \
+  outputs/qwen36_down_v2_pilot/ablation_metrics.json \
+  outputs/qwen36_down_v2_pilot/skip_non_down_v2_rows.json \
+  rcq_logs/qwen36_down_v2_pilot.runner.log && \
+  ls -lh qwen36_down_v2_pilot_outputs.tgz"""
+)
+```
+
+Interpretation checklist:
+
+- If D3 is much better than D0 at acceptable `average_expert_bpw`, the immediate
+  fix is down `none + min2`.
+- If D5 beats D3 at similar or lower bpw, left-output is buying useful shared
+  output geometry.
+- If D6 beats D3 by a meaningful margin while staying at or below the bit
+  budget, prefer D6 over D3.
+- If D5/D6 do not beat D3, do not pay left-output shared overhead.
+- Treat this as layer-local routed MoE-output NMSE only, not full-model KL/PPL.
