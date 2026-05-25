@@ -146,6 +146,7 @@ PYTHONPATH="$RCQ_ROOT" python scripts/qwen36_single_layer_rcq_ablation.py \
   --dry-run \
   --model-id Qwen/Qwen3.6-35B-A3B \
   --layer-id 0 \
+  --verbose \
   --output-dir "$RCQ_OUT" \
   --cache-dir "$HF_HOME"
 
@@ -235,6 +236,7 @@ PYTHONPATH="$RCQ_ROOT" python scripts/qwen36_single_layer_rcq_ablation.py \
   --eval-docs 64 \
   --max-tokens-per-doc 4096 \
   --activation-source true_layer0_post_attention_norm \
+  --verbose \
   --output-dir "$RCQ_OUT" \
   --cache-dir "$HF_HOME"
 
@@ -286,3 +288,105 @@ diagnostics.
 ```
 
 Do not claim full-model KL, PPL, or downstream quality from this slice.
+
+## 6. Best Time-To-Insight Pilot
+
+Purpose: run a proper, non-proxy pilot before the full 256/64/4096 ablation.
+This uses true layer-0 MoE inputs through the official layer-0 token mixer,
+streams real FineWeb-Edu text, keeps a held-out split, and runs the most useful
+early RCQ ablations.
+
+Settings:
+
+```text
+calibration: first 32 streamed FineWeb-Edu docs
+held-out eval: next 8 streamed FineWeb-Edu docs
+max tokens per doc: 1024
+activation source: true_layer0_post_attention_norm
+experiments: first 13 rows, through A4 rescue configs
+```
+
+```bash
+%%bash
+set -euo pipefail
+
+export RCQ_REPO_URL=https://github.com/AarushCodes/rcq.git
+export RCQ_COMMIT="$(git ls-remote "$RCQ_REPO_URL" refs/heads/main | awk '{print $1}')"
+export RCQ_ROOT=/kaggle/working/rcq
+export HF_HOME=/kaggle/working/hf_cache
+export TRANSFORMERS_CACHE=/kaggle/working/hf_cache
+export RCQ_OUT=/kaggle/working/outputs/qwen36_single_layer_rcq_pilot
+export RCQ_LOG_DIR=/kaggle/working/rcq_logs
+mkdir -p /kaggle/working/outputs "$HF_HOME" "$RCQ_LOG_DIR"
+
+exec > >(tee -a "$RCQ_LOG_DIR/qwen36_single_layer_rcq_pilot.log") 2>&1
+
+echo "=== selected commit ==="
+echo "$RCQ_COMMIT"
+
+echo "=== gpu ==="
+nvidia-smi || true
+
+echo "=== clone repo ==="
+rm -rf "$RCQ_ROOT"
+git clone "$RCQ_REPO_URL" "$RCQ_ROOT"
+cd "$RCQ_ROOT"
+git checkout "$RCQ_COMMIT"
+git rev-parse HEAD
+
+echo "=== ensure qwen3.5 moe transformers support ==="
+python -m pip install -U "transformers>=5.9.0,<6"
+python - <<'PY'
+import transformers
+print("transformers", transformers.__version__)
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeDecoderLayer
+print("qwen3_5_moe_decoder_layer_import", Qwen3_5MoeDecoderLayer.__name__)
+PY
+
+echo "=== run pilot ablations ==="
+PYTHONPATH="$RCQ_ROOT" python scripts/qwen36_single_layer_rcq_ablation.py \
+  --model-id Qwen/Qwen3.6-35B-A3B \
+  --layer-id 0 \
+  --calib-docs 32 \
+  --eval-docs 8 \
+  --max-tokens-per-doc 1024 \
+  --activation-source true_layer0_post_attention_norm \
+  --max-experiments 13 \
+  --verbose \
+  --output-dir "$RCQ_OUT" \
+  --cache-dir "$HF_HOME"
+
+echo "=== compact pilot summary ==="
+python - <<'PY'
+import json
+
+p = "/kaggle/working/outputs/qwen36_single_layer_rcq_pilot/ablation_metrics.json"
+d = json.load(open(p))
+print("status", d["status"])
+print("activation_source", d["activation_source"])
+print("activation_source_detail", d["activation_source_detail"])
+print("doc_policy", d["doc_policy"])
+print("elapsed_sec", d["elapsed_sec"])
+for row in d["results"]:
+    if row["status"] != "ok":
+        print(row["label"], row["status"], row.get("reason"))
+        continue
+    held = row.get("heldout", {})
+    print(row["label"], "heldout_mse", held.get("mse"), "heldout_rmse", held.get("rmse"))
+PY
+
+echo "=== package compact results ==="
+cd /kaggle/working
+tar -czf qwen36_single_layer_rcq_pilot_outputs.tgz \
+  outputs/qwen36_single_layer_rcq_pilot/run_manifest.json \
+  outputs/qwen36_single_layer_rcq_pilot/index_summary.json \
+  outputs/qwen36_single_layer_rcq_pilot/ablation_metrics.json \
+  rcq_logs/qwen36_single_layer_rcq_pilot.log
+ls -lh qwen36_single_layer_rcq_pilot_outputs.tgz
+```
+
+Paste back:
+
+- the `=== compact pilot summary ===` section;
+- any error trace if the cell fails;
+- whether the result bundle was created.

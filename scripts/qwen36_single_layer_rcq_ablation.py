@@ -39,6 +39,12 @@ from rcq_moe.storage import expert_bpw
 
 DEFAULT_MODEL_ID = "Qwen/Qwen3.6-35B-A3B"
 DEFAULT_DATASET = "HuggingFaceFW/fineweb-edu"
+VERBOSE = False
+
+
+def _log(message: str, *, force: bool = False) -> None:
+    if VERBOSE or force:
+        print(f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] {message}", flush=True)
 
 
 @dataclass
@@ -417,6 +423,7 @@ def _hidden_from_ids(input_ids: torch.Tensor, layer: LoadedLayer, device: torch.
 def _load_raw_docs(dataset: str, split: str, text_field: str, count: int) -> list[str]:
     from datasets import load_dataset
 
+    _log(f"streaming dataset={dataset} split={split} target_docs={count}", force=True)
     docs: list[str] = []
     stream = load_dataset(dataset, split=split, streaming=True)
     for row in stream:
@@ -424,6 +431,8 @@ def _load_raw_docs(dataset: str, split: str, text_field: str, count: int) -> lis
         if not isinstance(value, str):
             raise ValueError(f"text field {text_field!r} is not a string in streamed row {len(docs)}")
         docs.append(value)
+        if len(docs) == 1 or len(docs) % 16 == 0 or len(docs) == count:
+            _log(f"streamed_docs={len(docs)}/{count}", force=True)
         if len(docs) >= count:
             return docs
     raise ValueError(f"dataset stream ended after {len(docs)} docs, need {count}")
@@ -481,10 +490,14 @@ def _download_shards_for_keys(
 ) -> dict[str, Path]:
     weight_map = index["weight_map"]
     shard_names = sorted({weight_map[key] for key in keys})
-    return {
-        shard: Path(_hf_download(model_id, shard, revision, token, cache_dir))
-        for shard in shard_names
-    }
+    _log(f"downloading/resolving {len(shard_names)} safetensor shard(s): {shard_names}", force=True)
+    paths: dict[str, Path] = {}
+    for shard in shard_names:
+        before = time.time()
+        paths[shard] = Path(_hf_download(model_id, shard, revision, token, cache_dir))
+        size_gb = paths[shard].stat().st_size / 1024**3
+        _log(f"resolved shard {shard} size_gb={size_gb:.3f} elapsed_sec={time.time() - before:.1f}", force=True)
+    return paths
 
 
 def _read_tensors(shards: dict[str, Path], index: dict[str, Any], keys: list[str], *, dtype: torch.dtype) -> dict[str, torch.Tensor]:
@@ -496,9 +509,11 @@ def _read_tensors(shards: dict[str, Path], index: dict[str, Any], keys: list[str
 
     tensors: dict[str, torch.Tensor] = {}
     for shard, shard_keys in by_shard.items():
+        _log(f"reading {len(shard_keys)} tensor(s) from {shard}", force=True)
         with safe_open(shards[shard], framework="pt", device="cpu") as handle:
             for key in shard_keys:
                 tensors[key] = handle.get_tensor(key).to(dtype=dtype)
+        _log(f"finished reading shard {shard}", force=True)
     return tensors
 
 
@@ -743,6 +758,10 @@ def collect_stats(
     weighted: bool,
     activation_source: str,
 ) -> dict[str, LinearCalibrationStats]:
+    _log(
+        f"collect_stats start docs={len(docs)} weighted={weighted} activation_source={activation_source} block_size={block_size}",
+        force=True,
+    )
     model_name = "qwen36-single-layer"
     stats = {
         "gate": StreamingStats.create(
@@ -774,8 +793,11 @@ def collect_stats(
         ),
     }
 
-    for doc in docs:
+    started = time.time()
+    token_total = 0
+    for doc_idx, doc in enumerate(docs, start=1):
         input_ids = _tokenize_doc(tokenizer, doc, max_tokens_per_doc, device)
+        token_total += int(input_ids.numel())
         hidden = _hidden_from_ids(input_ids, layer, device, activation_source=activation_source)
         router_weights, selected = _route(hidden, layer.router_weight.to(device=device, dtype=hidden.dtype), layer.top_k)
         for expert_id in range(layer.router_weight.shape[0]):
@@ -795,8 +817,16 @@ def collect_stats(
         del input_ids, hidden, router_weights, selected
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        if doc_idx == 1 or doc_idx % 4 == 0 or doc_idx == len(docs):
+            _log(
+                f"collect_stats progress docs={doc_idx}/{len(docs)} tokens={token_total} "
+                f"weighted={weighted} elapsed_sec={time.time() - started:.1f}",
+                force=True,
+            )
 
-    return {name: item.finish() for name, item in stats.items()}
+    finished = {name: item.finish() for name, item in stats.items()}
+    _log(f"collect_stats done weighted={weighted} elapsed_sec={time.time() - started:.1f}", force=True)
+    return finished
 
 
 def _binary_quantize(z: torch.Tensor, moments: torch.Tensor, *, weighted_scale: bool) -> tuple[torch.Tensor, torch.Tensor]:
@@ -924,6 +954,13 @@ def build_q_moe(
     weighted_scale: bool,
     rescue_config: RescueConfig | None,
 ) -> QuantizedMoe:
+    _log(
+        "build_q_moe start "
+        f"rank_divisor={rank_divisor} use_hadamard={use_hadamard} "
+        f"weighted_scale={weighted_scale} rescue={rescue_config.name if rescue_config else None}",
+        force=True,
+    )
+    started = time.time()
     rank_hidden = _rank_for_divisor(layer.router_weight.shape[1], rank_divisor)
     rank_intermediate = _rank_for_divisor(layer.down_weight.shape[2], rank_divisor)
     kwargs = {
@@ -933,11 +970,13 @@ def build_q_moe(
         "model_name": "qwen36-single-layer",
         "layer_id": 0,
     }
-    return QuantizedMoe(
+    q_moe = QuantizedMoe(
         gate=quantize_linear(layer.gate_weight, stats["gate"], rank=rank_hidden, linear_type="gate", **kwargs),
         up=quantize_linear(layer.up_weight, stats["up"], rank=rank_hidden, linear_type="up", **kwargs),
         down=quantize_linear(layer.down_weight, stats["down"], rank=rank_intermediate, linear_type="down", **kwargs),
     )
+    _log(f"build_q_moe done elapsed_sec={time.time() - started:.1f}", force=True)
+    return q_moe
 
 
 def evaluate_docs(
@@ -952,9 +991,17 @@ def evaluate_docs(
     activation_source: str,
     correction_fit: OnlineChannelRegression | None = None,
 ) -> dict[str, float]:
+    _log(
+        f"evaluate_docs start docs={len(docs)} q_moe={'yes' if q_moe is not None else 'no'} "
+        f"include_shared={include_shared} activation_source={activation_source}",
+        force=True,
+    )
     acc = MSEAccumulator()
-    for doc in docs:
+    started = time.time()
+    token_total = 0
+    for doc_idx, doc in enumerate(docs, start=1):
         input_ids = _tokenize_doc(tokenizer, doc, max_tokens_per_doc, device)
+        token_total += int(input_ids.numel())
         hidden = _hidden_from_ids(input_ids, layer, device, activation_source=activation_source)
         with torch.inference_mode():
             fp = moe_output(hidden, layer, None, include_shared=include_shared)
@@ -968,7 +1015,15 @@ def evaluate_docs(
         del input_ids, hidden, fp, q
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    return acc.summary()
+        if doc_idx == 1 or doc_idx % 4 == 0 or doc_idx == len(docs):
+            _log(
+                f"evaluate_docs progress docs={doc_idx}/{len(docs)} tokens={token_total} "
+                f"elapsed_sec={time.time() - started:.1f}",
+                force=True,
+            )
+    summary = acc.summary()
+    _log(f"evaluate_docs done mse={summary['mse']:.6g} elapsed_sec={time.time() - started:.1f}", force=True)
+    return summary
 
 
 def _fit_routed_correction(
@@ -1053,6 +1108,7 @@ def run_ablation(
     include_shared: bool,
     activation_source: str,
 ) -> dict[str, Any]:
+    _log(f"ablation start label={label}", force=True)
     started = time.time()
     q_moe = build_q_moe(
         layer,
@@ -1112,6 +1168,7 @@ def run_ablation(
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    _log(f"ablation done label={label} heldout_mse={heldout['mse']:.6g} elapsed_sec={payload['elapsed_sec']:.1f}", force=True)
     return payload
 
 
@@ -1138,8 +1195,12 @@ def main() -> None:
         default="true_layer0_post_attention_norm",
         help="Default runs layer-0 attention before the MoE. Proxy mode is for debugging only.",
     )
+    parser.add_argument("--verbose", action="store_true", help="Print timestamped progress logs for Kaggle notebooks.")
     parser.add_argument("--max-experiments", type=int, help="Run only the first N ablation experiments.")
     args = parser.parse_args()
+
+    global VERBOSE
+    VERBOSE = args.verbose
 
     del args.local_files_only  # Kept for CLI symmetry; hf_hub_download handles cache via cache_dir.
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1177,17 +1238,25 @@ def main() -> None:
         },
     }
     _write_json(args.output_dir / "run_manifest.json", manifest)
+    _log(
+        f"run start model_id={args.model_id} layer_id={args.layer_id} "
+        f"calib_docs={args.calib_docs} eval_docs={args.eval_docs} max_tokens={args.max_tokens_per_doc}",
+        force=True,
+    )
 
     if args.dry_run:
+        _log("dry_run inspect start", force=True)
         summary = inspect_only(model_id=args.model_id, revision=args.revision, token=token, cache_dir=args.cache_dir, layer_id=args.layer_id)
         summary["elapsed_sec"] = time.time() - started
         _write_json(args.output_dir / "index_summary.json", summary)
         _write_json(args.output_dir / "ablation_metrics.json", {"dry_run": True, "status": "ok"})
+        _log("dry_run inspect done", force=True)
         return
 
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, revision=args.revision, token=token, cache_dir=args.cache_dir)
+    _log(f"tokenizer loaded class={tokenizer.__class__.__name__}", force=True)
     layer, layer_summary = load_layer(
         model_id=args.model_id,
         revision=args.revision,
@@ -1195,6 +1264,11 @@ def main() -> None:
         cache_dir=args.cache_dir,
         layer_id=args.layer_id,
         dtype=torch.float16,
+    )
+    _log(
+        f"layer loaded layer_type={layer.layer_type} experts={layer.router_weight.shape[0]} "
+        f"hidden={layer.router_weight.shape[1]} moe_intermediate={layer.gate_weight.shape[1]}",
+        force=True,
     )
     if args.activation_source == "true_layer0_post_attention_norm" and (
         args.layer_id != 0 or layer.layer_type not in {"linear_attention", "full_attention"}
@@ -1208,6 +1282,7 @@ def main() -> None:
     docs = _load_raw_docs(args.dataset, args.split, args.text_field, args.calib_docs + args.eval_docs)
     calib_docs = docs[: args.calib_docs]
     eval_docs = docs[args.calib_docs :]
+    _log(f"doc split ready calib_docs={len(calib_docs)} eval_docs={len(eval_docs)}", force=True)
 
     weighted_stats = collect_stats(
         calib_docs,
