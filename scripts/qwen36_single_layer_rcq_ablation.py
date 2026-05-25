@@ -73,6 +73,8 @@ class LoadedLayer:
     attention_bias: bool
     rope_parameters: dict[str, Any]
     top_k: int
+    official_layer: Any | None = None
+    rotary_emb: Any | None = None
 
 
 @dataclass
@@ -375,6 +377,34 @@ def _hidden_from_ids(input_ids: torch.Tensor, layer: LoadedLayer, device: torch.
     if activation_source == "proxy_embedding_norm":
         return _rms_norm(embedding, layer.post_attention_norm_weight.to(device=device), layer.rms_norm_eps).reshape(-1, embedding.shape[-1])
     if activation_source == "true_layer0_post_attention_norm":
+        if layer.official_layer is not None:
+            official_layer = layer.official_layer.to(device=device, dtype=embedding.dtype)
+            official_layer.eval()
+            with torch.inference_mode():
+                residual = embedding
+                normed = official_layer.input_layernorm(embedding)
+                if layer.layer_type == "linear_attention":
+                    mixed = official_layer.linear_attn(hidden_states=normed, cache_params=None, attention_mask=None)
+                elif layer.layer_type == "full_attention":
+                    if layer.rotary_emb is None:
+                        raise ValueError("full_attention official path requires rotary_emb")
+                    rotary = layer.rotary_emb.to(device=device, dtype=embedding.dtype)
+                    position_ids = torch.arange(embedding.shape[1], device=device).view(1, 1, -1).expand(4, embedding.shape[0], -1)
+                    position_embeddings = rotary(embedding, position_ids)
+                    seq_len = embedding.shape[1]
+                    mask = torch.full((seq_len, seq_len), torch.finfo(embedding.dtype).min, device=device, dtype=embedding.dtype)
+                    mask = torch.triu(mask, diagonal=1)[None, None, :, :]
+                    mixed, _ = official_layer.self_attn(
+                        hidden_states=normed,
+                        attention_mask=mask,
+                        position_ids=position_ids[0],
+                        past_key_values=None,
+                        position_embeddings=position_embeddings,
+                    )
+                else:
+                    raise ValueError(f"unsupported layer_type {layer.layer_type!r}")
+                hidden = residual + mixed
+                return official_layer.post_attention_layernorm(hidden).reshape(-1, hidden.shape[-1]).detach()
         if input_ids.shape[0] != 1:
             raise ValueError("true layer-0 attention path expects one document/batch row at a time")
         residual = embedding
@@ -472,6 +502,58 @@ def _read_tensors(shards: dict[str, Path], index: dict[str, Any], keys: list[str
     return tensors
 
 
+def _load_official_text_config(model_id: str, revision: str | None, token: str | None, cache_dir: str | None) -> Any:
+    try:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(model_id, revision=revision, token=token, cache_dir=cache_dir)
+        return _text_config(config)
+    except Exception as exc:
+        raise RuntimeError(
+            "Transformers does not recognize this Qwen MoE checkpoint. In Kaggle, install a newer Transformers "
+            "before running this script, for example: python -m pip install -U 'transformers>=5.9.0,<6'"
+        ) from exc
+
+
+def _official_layer_classes() -> tuple[Any, Any]:
+    try:
+        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+            Qwen3_5MoeDecoderLayer,
+            Qwen3_5MoeTextRotaryEmbedding,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Installed Transformers does not expose Qwen3.5-MoE text layer classes. "
+            "Install a newer Transformers build before running this script."
+        ) from exc
+    return Qwen3_5MoeDecoderLayer, Qwen3_5MoeTextRotaryEmbedding
+
+
+def _resolve_suffix_key(weight_map: dict[str, str], suffix: str) -> str | None:
+    suffix_dot = "." + suffix
+    matches = [key for key in weight_map if key == suffix or key.endswith(suffix_dot)]
+    if not matches:
+        return None
+    return sorted(matches, key=lambda item: (len(item), item))[0]
+
+
+def _resolve_layer_state_keys(index: dict[str, Any], layer_id: int, local_keys: list[str]) -> tuple[dict[str, str], list[str]]:
+    weight_map = index["weight_map"]
+    resolved: dict[str, str] = {}
+    missing: list[str] = []
+    for local_key in local_keys:
+        remote = _resolve_suffix_key(weight_map, f"layers.{layer_id}.{local_key}")
+        if remote is None:
+            missing.append(local_key)
+        else:
+            resolved[local_key] = remote
+    return resolved, missing
+
+
+def _resolve_embedding_key(index: dict[str, Any]) -> str | None:
+    return _resolve_suffix_key(index["weight_map"], "embed_tokens.weight")
+
+
 def _required_keys(layer_id: int) -> dict[str, str]:
     prefix = f"model.layers.{layer_id}"
     return {
@@ -520,18 +602,28 @@ def load_layer(
     layer_id: int,
     dtype: torch.dtype,
 ) -> tuple[LoadedLayer, dict[str, Any]]:
-    config = _load_config_json(model_id, revision, token, cache_dir)
-    text_config = _text_config(config)
+    text_config = _load_official_text_config(model_id, revision, token, cache_dir)
+    DecoderLayer, RotaryEmbedding = _official_layer_classes()
+    official_layer = DecoderLayer(text_config, layer_id)
+    rotary_emb = RotaryEmbedding(config=text_config)
     index = _load_index(model_id, revision, token, cache_dir)
-    key_map = _required_keys(layer_id)
-    optional_keys = {key_map["q_proj_bias"], key_map["k_proj_bias"], key_map["v_proj_bias"], key_map["o_proj_bias"]}
-    missing = [key for key in key_map.values() if key not in optional_keys and key not in index["weight_map"]]
+    layer_state_keys = list(official_layer.state_dict().keys())
+    resolved_layer_keys, missing_layer_keys = _resolve_layer_state_keys(index, layer_id, layer_state_keys)
+    embed_key = _resolve_embedding_key(index)
+    missing = list(missing_layer_keys)
+    if embed_key is None:
+        missing.append("embed_tokens.weight")
     if missing:
         raise KeyError(f"required tensors missing from safetensors index: {missing}")
-    existing_keys = [key for key in key_map.values() if key in index["weight_map"]]
+    existing_keys = [embed_key] + list(resolved_layer_keys.values())
     shards = _download_shards_for_keys(model_id, index, existing_keys, revision=revision, token=token, cache_dir=cache_dir)
     tensors = _read_tensors(shards, index, existing_keys, dtype=dtype)
-    gate_up = tensors[key_map["gate_up_weight"]]
+    layer_state = {local: tensors[remote] for local, remote in resolved_layer_keys.items()}
+    official_layer.load_state_dict(layer_state, strict=True)
+    official_layer.eval()
+    rotary_emb.eval()
+    experts = official_layer.mlp.experts
+    gate_up = experts.gate_up_proj.detach().cpu()
     intermediate = gate_up.shape[1] // 2
     layer_types = list(_getattr_any(text_config, ["layer_types"], []))
     layer_type = str(layer_types[layer_id]) if layer_id < len(layer_types) else "full_attention"
@@ -539,27 +631,27 @@ def load_layer(
     num_attention_heads = int(_getattr_any(text_config, ["num_attention_heads"]))
     num_key_value_heads = int(_getattr_any(text_config, ["num_key_value_heads"], num_attention_heads))
     layer = LoadedLayer(
-        embed_tokens=tensors[key_map["embed_tokens"]],
-        input_norm_weight=tensors[key_map["input_norm_weight"]],
-        post_attention_norm_weight=tensors[key_map["post_attention_norm_weight"]],
-        q_proj_weight=tensors[key_map["q_proj_weight"]],
-        q_proj_bias=tensors.get(key_map["q_proj_bias"]),
-        k_proj_weight=tensors[key_map["k_proj_weight"]],
-        k_proj_bias=tensors.get(key_map["k_proj_bias"]),
-        v_proj_weight=tensors[key_map["v_proj_weight"]],
-        v_proj_bias=tensors.get(key_map["v_proj_bias"]),
-        o_proj_weight=tensors[key_map["o_proj_weight"]],
-        o_proj_bias=tensors.get(key_map["o_proj_bias"]),
-        q_norm_weight=tensors[key_map["q_norm_weight"]],
-        k_norm_weight=tensors[key_map["k_norm_weight"]],
-        router_weight=tensors[key_map["router_weight"]],
+        embed_tokens=tensors[embed_key],
+        input_norm_weight=official_layer.input_layernorm.weight.detach().cpu(),
+        post_attention_norm_weight=official_layer.post_attention_layernorm.weight.detach().cpu(),
+        q_proj_weight=torch.empty(0),
+        q_proj_bias=None,
+        k_proj_weight=torch.empty(0),
+        k_proj_bias=None,
+        v_proj_weight=torch.empty(0),
+        v_proj_bias=None,
+        o_proj_weight=torch.empty(0),
+        o_proj_bias=None,
+        q_norm_weight=torch.empty(0),
+        k_norm_weight=torch.empty(0),
+        router_weight=official_layer.mlp.gate.weight.detach().cpu(),
         gate_weight=gate_up[:, :intermediate, :].contiguous(),
         up_weight=gate_up[:, intermediate:, :].contiguous(),
-        down_weight=tensors[key_map["down_weight"]],
-        shared_gate_weight=tensors[key_map["shared_gate_weight"]],
-        shared_up_weight=tensors[key_map["shared_up_weight"]],
-        shared_down_weight=tensors[key_map["shared_down_weight"]],
-        shared_expert_gate_weight=tensors[key_map["shared_expert_gate_weight"]],
+        down_weight=experts.down_proj.detach().cpu(),
+        shared_gate_weight=official_layer.mlp.shared_expert.gate_proj.weight.detach().cpu(),
+        shared_up_weight=official_layer.mlp.shared_expert.up_proj.weight.detach().cpu(),
+        shared_down_weight=official_layer.mlp.shared_expert.down_proj.weight.detach().cpu(),
+        shared_expert_gate_weight=official_layer.mlp.shared_expert_gate.weight.detach().cpu(),
         hidden_act=str(_getattr_any(text_config, ["hidden_act"], "silu")),
         rms_norm_eps=float(_getattr_any(text_config, ["rms_norm_eps"], 1e-6)),
         layer_type=layer_type,
@@ -569,6 +661,8 @@ def load_layer(
         attention_bias=bool(_getattr_any(text_config, ["attention_bias"], False)),
         rope_parameters=dict(_getattr_any(text_config, ["rope_parameters", "rope_scaling"], {})),
         top_k=int(_getattr_any(text_config, ["num_experts_per_tok"], 8)),
+        official_layer=official_layer,
+        rotary_emb=rotary_emb,
     )
     summary = {
         "model_type": _getattr_any(text_config, ["model_type"]),
@@ -585,6 +679,8 @@ def load_layer(
         "attention_bias": layer.attention_bias,
         "rope_parameters": layer.rope_parameters,
         "required_tensor_summary": _estimate_required_bytes(index, existing_keys),
+        "matched_layer_tensor_count": len(resolved_layer_keys),
+        "matched_layer_key_examples": dict(list(resolved_layer_keys.items())[:20]),
     }
     return layer, summary
 
@@ -597,14 +693,19 @@ def inspect_only(
     cache_dir: str | None,
     layer_id: int,
 ) -> dict[str, Any]:
-    config = _load_config_json(model_id, revision, token, cache_dir)
-    text_config = _text_config(config)
+    text_config = _load_official_text_config(model_id, revision, token, cache_dir)
+    DecoderLayer, _ = _official_layer_classes()
+    official_layer = DecoderLayer(text_config, layer_id)
     index = _load_index(model_id, revision, token, cache_dir)
-    key_map = _required_keys(layer_id)
-    optional_keys = {key_map["q_proj_bias"], key_map["k_proj_bias"], key_map["v_proj_bias"], key_map["o_proj_bias"]}
-    missing = [key for key in key_map.values() if key not in optional_keys and key not in index["weight_map"]]
+    layer_state_keys = list(official_layer.state_dict().keys())
+    resolved_layer_keys, missing_layer_keys = _resolve_layer_state_keys(index, layer_id, layer_state_keys)
+    embed_key = _resolve_embedding_key(index)
+    missing = list(missing_layer_keys)
+    if embed_key is None:
+        missing.append("embed_tokens.weight")
     layer_types = list(_getattr_any(text_config, ["layer_types"], []))
     layer_type = str(layer_types[layer_id]) if layer_id < len(layer_types) else "full_attention"
+    existing_keys = ([] if embed_key is None else [embed_key]) + list(resolved_layer_keys.values())
     return {
         "model_id": model_id,
         "revision": revision,
@@ -622,7 +723,12 @@ def inspect_only(
         "attention_bias": _getattr_any(text_config, ["attention_bias"]),
         "rope_parameters": _getattr_any(text_config, ["rope_parameters", "rope_scaling"], {}),
         "missing_required_tensors": missing,
-        "required_tensor_summary": _estimate_required_bytes(index, [key for key in key_map.values() if key in index["weight_map"]]),
+        "expected_layer_tensor_count": len(layer_state_keys),
+        "matched_layer_tensor_count": len(resolved_layer_keys),
+        "matched_embedding_key": embed_key,
+        "matched_layer_key_examples": dict(list(resolved_layer_keys.items())[:40]),
+        "layer_type_schedule_prefix": layer_types[:16],
+        "required_tensor_summary": _estimate_required_bytes(index, existing_keys),
     }
 
 
@@ -1090,9 +1196,11 @@ def main() -> None:
         layer_id=args.layer_id,
         dtype=torch.float16,
     )
-    if args.activation_source == "true_layer0_post_attention_norm" and (args.layer_id != 0 or layer.layer_type != "full_attention"):
+    if args.activation_source == "true_layer0_post_attention_norm" and (
+        args.layer_id != 0 or layer.layer_type not in {"linear_attention", "full_attention"}
+    ):
         raise ValueError(
-            "proper true activation mode currently supports only layer_id=0 with layer_type='full_attention'. "
+            "proper true activation mode currently supports only layer_id=0 with official linear_attention/full_attention. "
             f"got layer_id={args.layer_id}, layer_type={layer.layer_type!r}"
         )
     _write_json(args.output_dir / "index_summary.json", layer_summary)

@@ -132,6 +132,15 @@ cd "$RCQ_ROOT"
 git checkout "$RCQ_COMMIT"
 git rev-parse HEAD
 
+echo "=== ensure qwen3.5 moe transformers support ==="
+python -m pip install -U "transformers>=5.9.0,<6"
+python - <<'PY'
+import transformers
+print("transformers", transformers.__version__)
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeDecoderLayer
+print("qwen3_5_moe_decoder_layer_import", Qwen3_5MoeDecoderLayer.__name__)
+PY
+
 echo "=== dry-run inspect ==="
 PYTHONPATH="$RCQ_ROOT" python scripts/qwen36_single_layer_rcq_ablation.py \
   --dry-run \
@@ -155,6 +164,10 @@ print("layer_type", d.get("layer_type"))
 print("attention_bias", d.get("attention_bias"))
 print("rope_parameters", d.get("rope_parameters"))
 print("missing_required_tensors", d.get("missing_required_tensors"))
+print("expected_layer_tensor_count", d.get("expected_layer_tensor_count"))
+print("matched_layer_tensor_count", d.get("matched_layer_tensor_count"))
+print("matched_embedding_key", d.get("matched_embedding_key"))
+print("layer_type_schedule_prefix", d.get("layer_type_schedule_prefix"))
 print("required_shard_count", d["required_tensor_summary"]["required_shard_count"])
 print("required_shards", d["required_tensor_summary"]["required_shards"])
 PY
@@ -204,6 +217,15 @@ git clone "$RCQ_REPO_URL" "$RCQ_ROOT"
 cd "$RCQ_ROOT"
 git checkout "$RCQ_COMMIT"
 git rev-parse HEAD
+
+echo "=== ensure qwen3.5 moe transformers support ==="
+python -m pip install -U "transformers>=5.9.0,<6"
+python - <<'PY'
+import transformers
+print("transformers", transformers.__version__)
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeDecoderLayer
+print("qwen3_5_moe_decoder_layer_import", Qwen3_5MoeDecoderLayer.__name__)
+PY
 
 echo "=== run ablations ==="
 PYTHONPATH="$RCQ_ROOT" python scripts/qwen36_single_layer_rcq_ablation.py \
