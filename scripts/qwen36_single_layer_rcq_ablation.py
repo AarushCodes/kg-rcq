@@ -192,6 +192,18 @@ class MSEAccumulator:
         }
 
 
+@dataclass
+class CachedBatch:
+    hidden: torch.Tensor
+    router_weights: torch.Tensor
+    selected_experts: torch.Tensor
+    fp_output: torch.Tensor
+
+    @property
+    def token_count(self) -> int:
+        return int(self.hidden.shape[0])
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -370,6 +382,25 @@ def _expert_moe_output(
 
 def moe_output(hidden: torch.Tensor, layer: LoadedLayer, q_moe: QuantizedMoe | None = None, *, include_shared: bool) -> torch.Tensor:
     router_weights, selected_experts = _route(hidden, layer.router_weight.to(device=hidden.device, dtype=hidden.dtype), layer.top_k)
+    return moe_output_with_routing(
+        hidden,
+        router_weights,
+        selected_experts,
+        layer,
+        q_moe,
+        include_shared=include_shared,
+    )
+
+
+def moe_output_with_routing(
+    hidden: torch.Tensor,
+    router_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    layer: LoadedLayer,
+    q_moe: QuantizedMoe | None = None,
+    *,
+    include_shared: bool,
+) -> torch.Tensor:
     out = _expert_moe_output(hidden, router_weights, selected_experts, layer=layer, q_moe=q_moe)
     if include_shared:
         out = out + _shared_expert(hidden, layer)
@@ -829,6 +860,130 @@ def collect_stats(
     return finished
 
 
+def build_cached_batches(
+    docs: list[str],
+    tokenizer: Any,
+    layer: LoadedLayer,
+    *,
+    max_tokens_per_doc: int,
+    device: torch.device,
+    activation_source: str,
+    include_shared: bool,
+    split_name: str,
+) -> list[CachedBatch]:
+    _log(f"cache_build start split={split_name} docs={len(docs)} activation_source={activation_source}", force=True)
+    started = time.time()
+    batches: list[CachedBatch] = []
+    token_total = 0
+    for doc_idx, doc in enumerate(docs, start=1):
+        input_ids = _tokenize_doc(tokenizer, doc, max_tokens_per_doc, device)
+        hidden = _hidden_from_ids(input_ids, layer, device, activation_source=activation_source)
+        router_weights, selected = _route(hidden, layer.router_weight.to(device=device, dtype=hidden.dtype), layer.top_k)
+        with torch.inference_mode():
+            fp_output = moe_output_with_routing(
+                hidden,
+                router_weights,
+                selected,
+                layer,
+                None,
+                include_shared=include_shared,
+            )
+        batches.append(
+            CachedBatch(
+                hidden=hidden.detach().cpu(),
+                router_weights=router_weights.detach().cpu(),
+                selected_experts=selected.detach().cpu(),
+                fp_output=fp_output.detach().cpu(),
+            )
+        )
+        token_total += int(hidden.shape[0])
+        del input_ids, hidden, router_weights, selected, fp_output
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if doc_idx == 1 or doc_idx % 4 == 0 or doc_idx == len(docs):
+            _log(
+                f"cache_build progress split={split_name} docs={doc_idx}/{len(docs)} "
+                f"tokens={token_total} elapsed_sec={time.time() - started:.1f}",
+                force=True,
+            )
+    _log(f"cache_build done split={split_name} batches={len(batches)} tokens={token_total} elapsed_sec={time.time() - started:.1f}", force=True)
+    return batches
+
+
+def collect_stats_from_cache(
+    batches: list[CachedBatch],
+    layer: LoadedLayer,
+    *,
+    block_size: int,
+    device: torch.device,
+    weighted: bool,
+) -> dict[str, LinearCalibrationStats]:
+    _log(f"collect_stats_from_cache start batches={len(batches)} weighted={weighted} block_size={block_size}", force=True)
+    model_name = "qwen36-single-layer"
+    stats = {
+        "gate": StreamingStats.create(
+            num_experts=layer.router_weight.shape[0],
+            input_dim=layer.router_weight.shape[1],
+            block_size=block_size,
+            model_name=model_name,
+            layer_id=0,
+            linear_type="gate",
+            device=device,
+        ),
+        "up": StreamingStats.create(
+            num_experts=layer.router_weight.shape[0],
+            input_dim=layer.router_weight.shape[1],
+            block_size=block_size,
+            model_name=model_name,
+            layer_id=0,
+            linear_type="up",
+            device=device,
+        ),
+        "down": StreamingStats.create(
+            num_experts=layer.router_weight.shape[0],
+            input_dim=layer.down_weight.shape[2],
+            block_size=block_size,
+            model_name=model_name,
+            layer_id=0,
+            linear_type="down",
+            device=device,
+        ),
+    }
+    started = time.time()
+    token_total = 0
+    for batch_idx, batch in enumerate(batches, start=1):
+        hidden = batch.hidden.to(device=device)
+        router_weights = batch.router_weights.to(device=device)
+        selected = batch.selected_experts.to(device=device)
+        token_total += batch.token_count
+        for expert_id in range(layer.router_weight.shape[0]):
+            positions = selected == expert_id
+            if not positions.any():
+                continue
+            token_idx, slot_idx = torch.where(positions)
+            current = hidden[token_idx]
+            route = router_weights[token_idx, slot_idx]
+            stat_weight = route.square() if weighted else torch.ones_like(route)
+            stats["gate"].update(current, stat_weight, expert_id)
+            stats["up"].update(current, stat_weight, expert_id)
+            gate = _linear_weight(current, layer.gate_weight[expert_id].to(device=device, dtype=hidden.dtype))
+            up = _linear_weight(current, layer.up_weight[expert_id].to(device=device, dtype=hidden.dtype))
+            down_input = _act(gate, layer.hidden_act) * up
+            stats["down"].update(down_input, stat_weight, expert_id)
+        del hidden, router_weights, selected
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if batch_idx == 1 or batch_idx % 4 == 0 or batch_idx == len(batches):
+            _log(
+                f"collect_stats_from_cache progress batches={batch_idx}/{len(batches)} "
+                f"tokens={token_total} weighted={weighted} elapsed_sec={time.time() - started:.1f}",
+                force=True,
+            )
+    finished = {name: item.finish() for name, item in stats.items()}
+    _log(f"collect_stats_from_cache done weighted={weighted} elapsed_sec={time.time() - started:.1f}", force=True)
+    return finished
+
+
 def _binary_quantize(z: torch.Tensor, moments: torch.Tensor, *, weighted_scale: bool) -> tuple[torch.Tensor, torch.Tensor]:
     signs = torch.where(z >= 0, torch.ones_like(z), -torch.ones_like(z))
     if weighted_scale:
@@ -1026,6 +1181,59 @@ def evaluate_docs(
     return summary
 
 
+def evaluate_cached_batches(
+    batches: list[CachedBatch],
+    layer: LoadedLayer,
+    q_moe: QuantizedMoe | None,
+    *,
+    device: torch.device,
+    include_shared: bool,
+    correction_fit: OnlineChannelRegression | None = None,
+) -> dict[str, float]:
+    _log(
+        f"evaluate_cached_batches start batches={len(batches)} q_moe={'yes' if q_moe is not None else 'no'} "
+        f"include_shared={include_shared}",
+        force=True,
+    )
+    acc = MSEAccumulator()
+    started = time.time()
+    token_total = 0
+    for batch_idx, batch in enumerate(batches, start=1):
+        hidden = batch.hidden.to(device=device)
+        fp = batch.fp_output.to(device=device)
+        if q_moe is None:
+            q = fp
+        else:
+            router_weights = batch.router_weights.to(device=device)
+            selected = batch.selected_experts.to(device=device)
+            with torch.inference_mode():
+                q = moe_output_with_routing(
+                    hidden,
+                    router_weights,
+                    selected,
+                    layer,
+                    q_moe,
+                    include_shared=include_shared,
+                )
+            del router_weights, selected
+        acc.update(fp, q)
+        if correction_fit is not None:
+            correction_fit.update(fp, q)
+        token_total += batch.token_count
+        del hidden, fp, q
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if batch_idx == 1 or batch_idx % 4 == 0 or batch_idx == len(batches):
+            _log(
+                f"evaluate_cached_batches progress batches={batch_idx}/{len(batches)} "
+                f"tokens={token_total} elapsed_sec={time.time() - started:.1f}",
+                force=True,
+            )
+    summary = acc.summary()
+    _log(f"evaluate_cached_batches done mse={summary['mse']:.6g} elapsed_sec={time.time() - started:.1f}", force=True)
+    return summary
+
+
 def _fit_routed_correction(
     calib_docs: list[str],
     tokenizer: Any,
@@ -1062,6 +1270,30 @@ def _fit_routed_correction(
         include_shared=include_shared,
         activation_source=activation_source,
     )
+    return {"calib_mse_before": before["mse"], "calib_mse_after": after["mse"]}
+
+
+def _fit_routed_correction_cached(
+    calib_batches: list[CachedBatch],
+    layer: LoadedLayer,
+    q_moe: QuantizedMoe,
+    *,
+    device: torch.device,
+    include_shared: bool,
+) -> dict[str, float]:
+    stats = OnlineChannelRegression(dim=layer.router_weight.shape[1], dtype=torch.float32, device=device)
+    before = evaluate_cached_batches(
+        calib_batches,
+        layer,
+        q_moe,
+        device=device,
+        include_shared=include_shared,
+        correction_fit=stats,
+    )
+    alpha, beta = stats.solve()
+    q_moe.correction_alpha = alpha
+    q_moe.correction_beta = beta
+    after = evaluate_cached_batches(calib_batches, layer, q_moe, device=device, include_shared=include_shared)
     return {"calib_mse_before": before["mse"], "calib_mse_after": after["mse"]}
 
 
@@ -1150,6 +1382,64 @@ def run_ablation(
         include_shared=include_shared,
         activation_source=activation_source,
     )
+    payload = {
+        "label": label,
+        "status": "ok",
+        "rank_divisor": rank_divisor,
+        "use_hadamard": use_hadamard,
+        "weighted_scale": weighted_scale,
+        "rescue_config": rescue_config.name if rescue_config is not None else None,
+        "fit_routed_moe_output_correction": fit_correction,
+        "correction": correction,
+        "calibration": calib,
+        "heldout": heldout,
+        "diagnostics": _diagnostics(q_moe),
+        "elapsed_sec": time.time() - started,
+    }
+    del q_moe
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    _log(f"ablation done label={label} heldout_mse={heldout['mse']:.6g} elapsed_sec={payload['elapsed_sec']:.1f}", force=True)
+    return payload
+
+
+def run_ablation_cached(
+    label: str,
+    layer: LoadedLayer,
+    calib_batches: list[CachedBatch],
+    eval_batches: list[CachedBatch],
+    stats: dict[str, LinearCalibrationStats],
+    *,
+    rank_divisor: int,
+    use_hadamard: bool,
+    weighted_scale: bool,
+    rescue_config: RescueConfig | None,
+    fit_correction: bool,
+    device: torch.device,
+    include_shared: bool,
+) -> dict[str, Any]:
+    _log(f"ablation start label={label}", force=True)
+    started = time.time()
+    q_moe = build_q_moe(
+        layer,
+        stats,
+        rank_divisor=rank_divisor,
+        use_hadamard=use_hadamard,
+        weighted_scale=weighted_scale,
+        rescue_config=rescue_config,
+    )
+    correction = None
+    if fit_correction:
+        correction = _fit_routed_correction_cached(
+            calib_batches,
+            layer,
+            q_moe,
+            device=device,
+            include_shared=include_shared,
+        )
+    calib = evaluate_cached_batches(calib_batches, layer, q_moe, device=device, include_shared=include_shared)
+    heldout = evaluate_cached_batches(eval_batches, layer, q_moe, device=device, include_shared=include_shared)
     payload = {
         "label": label,
         "status": "ok",
@@ -1284,90 +1574,104 @@ def main() -> None:
     eval_docs = docs[args.calib_docs :]
     _log(f"doc split ready calib_docs={len(calib_docs)} eval_docs={len(eval_docs)}", force=True)
 
-    weighted_stats = collect_stats(
+    calib_batches = build_cached_batches(
         calib_docs,
         tokenizer,
         layer,
         max_tokens_per_doc=args.max_tokens_per_doc,
-        block_size=args.block_size,
         device=device,
-        weighted=True,
         activation_source=args.activation_source,
+        include_shared=args.include_shared_expert,
+        split_name="calibration",
     )
-    unweighted_stats = collect_stats(
-        calib_docs,
+    eval_batches = build_cached_batches(
+        eval_docs,
         tokenizer,
         layer,
         max_tokens_per_doc=args.max_tokens_per_doc,
-        block_size=args.block_size,
         device=device,
-        weighted=False,
         activation_source=args.activation_source,
+        include_shared=args.include_shared_expert,
+        split_name="heldout",
     )
+    if layer.official_layer is not None:
+        layer.official_layer.to(device="cpu")
+    if layer.rotary_emb is not None:
+        layer.rotary_emb.to(device="cpu")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    _log("released official token-mixer modules from GPU after cache build", force=True)
 
     experiments = [
         ("baseline_fp_layer_local", None),
         ("production_quantization_baseline", "not_available"),
         ("two_bit_expert_quantization_baseline", "not_available"),
         ("kbvq_like_baseline", "not_available"),
-        ("A0_shared_naive_1bit_no_hadamard_no_rescue_no_correction", dict(stats=weighted_stats, rank_divisor=128, use_hadamard=False, weighted_scale=False, rescue_config=None, fit_correction=False)),
-        ("A1_shared_hadamard_1bit_no_rescue_no_correction", dict(stats=weighted_stats, rank_divisor=128, use_hadamard=True, weighted_scale=False, rescue_config=None, fit_correction=False)),
-        ("A2_A1_activation_weighted_binary_scale", dict(stats=weighted_stats, rank_divisor=128, use_hadamard=True, weighted_scale=True, rescue_config=None, fit_correction=False)),
-        ("A3_A2_mixed_bit_rescue_rcq_1p55", dict(stats=weighted_stats, rank_divisor=128, use_hadamard=True, weighted_scale=True, rescue_config=RescueConfig.rcq_1p55(args.block_size), fit_correction=False)),
-        ("A3_A2_mixed_bit_rescue_rcq_1p75", dict(stats=weighted_stats, rank_divisor=128, use_hadamard=True, weighted_scale=True, rescue_config=RescueConfig.rcq_1p75(args.block_size), fit_correction=False)),
-        ("A3_A2_mixed_bit_rescue_rcq_1p90", dict(stats=weighted_stats, rank_divisor=128, use_hadamard=True, weighted_scale=True, rescue_config=RescueConfig.rcq_1p90(args.block_size), fit_correction=False)),
-        ("A4_A3_rcq_1p55_routed_moe_output_correction", dict(stats=weighted_stats, rank_divisor=128, use_hadamard=True, weighted_scale=True, rescue_config=RescueConfig.rcq_1p55(args.block_size), fit_correction=True)),
-        ("A4_A3_rcq_1p75_routed_moe_output_correction", dict(stats=weighted_stats, rank_divisor=128, use_hadamard=True, weighted_scale=True, rescue_config=RescueConfig.rcq_1p75(args.block_size), fit_correction=True)),
-        ("A4_A3_rcq_1p90_routed_moe_output_correction", dict(stats=weighted_stats, rank_divisor=128, use_hadamard=True, weighted_scale=True, rescue_config=RescueConfig.rcq_1p90(args.block_size), fit_correction=True)),
-        ("router_weighted_covariance_A4_rcq_1p75", dict(stats=weighted_stats, rank_divisor=128, use_hadamard=True, weighted_scale=True, rescue_config=RescueConfig.rcq_1p75(args.block_size), fit_correction=True)),
-        ("unweighted_covariance_A4_rcq_1p75", dict(stats=unweighted_stats, rank_divisor=128, use_hadamard=True, weighted_scale=True, rescue_config=RescueConfig.rcq_1p75(args.block_size), fit_correction=True)),
-        ("rank_n_over_256_A4_rcq_1p75", dict(stats=weighted_stats, rank_divisor=256, use_hadamard=True, weighted_scale=True, rescue_config=RescueConfig.rcq_1p75(args.block_size), fit_correction=True)),
-        ("rank_n_over_128_A4_rcq_1p75", dict(stats=weighted_stats, rank_divisor=128, use_hadamard=True, weighted_scale=True, rescue_config=RescueConfig.rcq_1p75(args.block_size), fit_correction=True)),
-        ("rank_n_over_64_A4_rcq_1p75", dict(stats=weighted_stats, rank_divisor=64, use_hadamard=True, weighted_scale=True, rescue_config=RescueConfig.rcq_1p75(args.block_size), fit_correction=True)),
+        ("A0_shared_naive_1bit_no_hadamard_no_rescue_no_correction", dict(stats_kind="weighted", rank_divisor=128, use_hadamard=False, weighted_scale=False, rescue_config=None, fit_correction=False)),
+        ("A1_shared_hadamard_1bit_no_rescue_no_correction", dict(stats_kind="weighted", rank_divisor=128, use_hadamard=True, weighted_scale=False, rescue_config=None, fit_correction=False)),
+        ("A2_A1_activation_weighted_binary_scale", dict(stats_kind="weighted", rank_divisor=128, use_hadamard=True, weighted_scale=True, rescue_config=None, fit_correction=False)),
+        ("A3_A2_mixed_bit_rescue_rcq_1p55", dict(stats_kind="weighted", rank_divisor=128, use_hadamard=True, weighted_scale=True, rescue_config=RescueConfig.rcq_1p55(args.block_size), fit_correction=False)),
+        ("A3_A2_mixed_bit_rescue_rcq_1p75", dict(stats_kind="weighted", rank_divisor=128, use_hadamard=True, weighted_scale=True, rescue_config=RescueConfig.rcq_1p75(args.block_size), fit_correction=False)),
+        ("A3_A2_mixed_bit_rescue_rcq_1p90", dict(stats_kind="weighted", rank_divisor=128, use_hadamard=True, weighted_scale=True, rescue_config=RescueConfig.rcq_1p90(args.block_size), fit_correction=False)),
+        ("A4_A3_rcq_1p55_routed_moe_output_correction", dict(stats_kind="weighted", rank_divisor=128, use_hadamard=True, weighted_scale=True, rescue_config=RescueConfig.rcq_1p55(args.block_size), fit_correction=True)),
+        ("A4_A3_rcq_1p75_routed_moe_output_correction", dict(stats_kind="weighted", rank_divisor=128, use_hadamard=True, weighted_scale=True, rescue_config=RescueConfig.rcq_1p75(args.block_size), fit_correction=True)),
+        ("A4_A3_rcq_1p90_routed_moe_output_correction", dict(stats_kind="weighted", rank_divisor=128, use_hadamard=True, weighted_scale=True, rescue_config=RescueConfig.rcq_1p90(args.block_size), fit_correction=True)),
+        ("router_weighted_covariance_A4_rcq_1p75", dict(stats_kind="weighted", rank_divisor=128, use_hadamard=True, weighted_scale=True, rescue_config=RescueConfig.rcq_1p75(args.block_size), fit_correction=True)),
+        ("unweighted_covariance_A4_rcq_1p75", dict(stats_kind="unweighted", rank_divisor=128, use_hadamard=True, weighted_scale=True, rescue_config=RescueConfig.rcq_1p75(args.block_size), fit_correction=True)),
+        ("rank_n_over_256_A4_rcq_1p75", dict(stats_kind="weighted", rank_divisor=256, use_hadamard=True, weighted_scale=True, rescue_config=RescueConfig.rcq_1p75(args.block_size), fit_correction=True)),
+        ("rank_n_over_128_A4_rcq_1p75", dict(stats_kind="weighted", rank_divisor=128, use_hadamard=True, weighted_scale=True, rescue_config=RescueConfig.rcq_1p75(args.block_size), fit_correction=True)),
+        ("rank_n_over_64_A4_rcq_1p75", dict(stats_kind="weighted", rank_divisor=64, use_hadamard=True, weighted_scale=True, rescue_config=RescueConfig.rcq_1p75(args.block_size), fit_correction=True)),
         ("grouped_subspaces_G1_G2_G4_G8", "not_available"),
         ("per_linear_output_affine_correction", "not_available"),
     ]
     if args.max_experiments is not None:
         experiments = experiments[: args.max_experiments]
 
+    stats_cache: dict[str, dict[str, LinearCalibrationStats]] = {}
+
+    def get_stats(kind: str) -> dict[str, LinearCalibrationStats]:
+        if kind not in stats_cache:
+            stats_cache[kind] = collect_stats_from_cache(
+                calib_batches,
+                layer,
+                block_size=args.block_size,
+                device=device,
+                weighted=(kind == "weighted"),
+            )
+        return stats_cache[kind]
+
     results: list[dict[str, Any]] = []
     for label, spec in experiments:
         if spec is None:
-            calib = evaluate_docs(
-                calib_docs,
-                tokenizer,
+            calib = evaluate_cached_batches(
+                calib_batches,
                 layer,
                 None,
-                max_tokens_per_doc=args.max_tokens_per_doc,
                 device=device,
                 include_shared=args.include_shared_expert,
-                activation_source=args.activation_source,
             )
-            heldout = evaluate_docs(
-                eval_docs,
-                tokenizer,
+            heldout = evaluate_cached_batches(
+                eval_batches,
                 layer,
                 None,
-                max_tokens_per_doc=args.max_tokens_per_doc,
                 device=device,
                 include_shared=args.include_shared_expert,
-                activation_source=args.activation_source,
             )
             results.append({"label": label, "status": "ok", "calibration": calib, "heldout": heldout})
         elif spec == "not_available":
             results.append({"label": label, "status": "not_available", "reason": "not implemented in this prototype slice"})
         else:
+            spec = dict(spec)
+            stats = get_stats(str(spec.pop("stats_kind")))
             results.append(
-                run_ablation(
+                run_ablation_cached(
                     label,
                     layer,
-                    tokenizer,
-                    calib_docs,
-                    eval_docs,
-                    max_tokens_per_doc=args.max_tokens_per_doc,
+                    calib_batches,
+                    eval_batches,
+                    stats,
                     device=device,
                     include_shared=args.include_shared_expert,
-                    activation_source=args.activation_source,
                     **spec,
                 )
             )
