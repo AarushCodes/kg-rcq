@@ -17,10 +17,20 @@ from .stats import LinearCalibrationStats, accumulate_covariance_and_moments
 class OfficialQwen35RCQLinearSet:
     decomposition: SharedDecomposition
     q_residuals: list[QuantizedResidual]
+    shared_mode: str = "right_input"
 
     def forward(self, hidden: torch.Tensor, expert_id: int) -> torch.Tensor:
-        a_factor = self.decomposition.a_factors[expert_id]
-        shared = (hidden @ self.decomposition.b_shared.T) @ a_factor.T
+        if self.shared_mode == "none":
+            shared = torch.zeros(
+                (*hidden.shape[:-1], self.q_residuals[expert_id].values.shape[0]),
+                dtype=hidden.dtype,
+                device=hidden.device,
+            )
+        elif self.shared_mode == "right_input":
+            a_factor = self.decomposition.a_factors[expert_id]
+            shared = (hidden @ self.decomposition.b_shared.T) @ a_factor.T
+        else:
+            raise ValueError(f"unsupported shared_mode: {self.shared_mode!r}")
         residual = hidden @ self.q_residuals[expert_id].dequantize().T
         return shared + residual
 
@@ -118,7 +128,11 @@ def _make_linear_set_from_state(state: dict[str, torch.Tensor | int | str], pref
         v_r=state[f"{prefix}.v_r"],
         captured_energy=float(state[f"{prefix}.captured_energy"]),
     )
-    return OfficialQwen35RCQLinearSet(decomposition=decomposition, q_residuals=residuals)
+    return OfficialQwen35RCQLinearSet(
+        decomposition=decomposition,
+        q_residuals=residuals,
+        shared_mode=str(state.get(f"{prefix}.shared_mode", "right_input")),
+    )
 
 
 class OfficialQwen35MoeRCQSparseMoeBlock(nn.Module):
@@ -294,18 +308,44 @@ def _quantize_linear_set(
     layer_id: int,
     linear_type: str,
     rank: int | None,
+    shared_mode: str = "right_input",
+    moment_mode: str = "global",
 ) -> OfficialQwen35RCQLinearSet:
     expert_weights = [weights[expert_id].detach().clone() for expert_id in range(weights.shape[0])]
-    decomposition = decompose_shared_subspace(expert_weights, stats.covariance, stats.expert_importance, rank=rank)
+    if shared_mode == "right_input":
+        decomposition = decompose_shared_subspace(expert_weights, stats.covariance, stats.expert_importance, rank=rank)
+    elif shared_mode == "none":
+        rows, cols = expert_weights[0].shape
+        dtype = expert_weights[0].dtype
+        device = expert_weights[0].device
+        decomposition = SharedDecomposition(
+            a_factors=[torch.empty((rows, 0), dtype=dtype, device=device) for _ in expert_weights],
+            b_shared=torch.empty((0, cols), dtype=dtype, device=device),
+            residuals=[weight.clone() for weight in expert_weights],
+            eigvals=torch.empty(0, dtype=dtype, device=device),
+            eigvecs=torch.empty((cols, 0), dtype=dtype, device=device),
+            v_r=torch.empty((cols, 0), dtype=dtype, device=device),
+            captured_energy=0.0,
+        )
+    else:
+        raise ValueError(f"unsupported shared_mode: {shared_mode!r}")
+    if moment_mode == "global":
+        moments = stats.rotated_second_moments
+    elif moment_mode == "per_expert":
+        if stats.per_expert_rotated_second_moments is None:
+            raise ValueError("per_expert moment_mode requires per_expert_rotated_second_moments")
+        moments = stats.per_expert_rotated_second_moments
+    else:
+        raise ValueError(f"unsupported moment_mode: {moment_mode!r}")
     q_residuals = quantize_residuals(
         decomposition.residuals,
-        stats.rotated_second_moments,
+        moments,
         rcq_config,
         model_name=model_name,
         layer_id=layer_id,
         linear_type=linear_type,
     )
-    return OfficialQwen35RCQLinearSet(decomposition=decomposition, q_residuals=q_residuals)
+    return OfficialQwen35RCQLinearSet(decomposition=decomposition, q_residuals=q_residuals, shared_mode=shared_mode)
 
 
 def _linear_diagnostics(
@@ -348,6 +388,8 @@ def _convert_block(
     model_name: str,
     layer_id: int,
     rank: int | None,
+    down_shared_mode: str = "right_input",
+    down_moment_mode: str = "global",
 ) -> tuple[OfficialQwen35MoeRCQSparseMoeBlock, dict[str, OfficialQwen35LinearDiagnostics]]:
     stats = _collect_block_stats(fp_block, mlp_input, rcq_config, model_name=model_name, layer_id=layer_id)
     experts = fp_block.experts
@@ -357,7 +399,17 @@ def _convert_block(
     down_weights = experts.down_proj
     q_gate = _quantize_linear_set(gate_weights, stats["gate"], rcq_config, model_name=model_name, layer_id=layer_id, linear_type="gate", rank=rank)
     q_up = _quantize_linear_set(up_weights, stats["up"], rcq_config, model_name=model_name, layer_id=layer_id, linear_type="up", rank=rank)
-    q_down = _quantize_linear_set(down_weights, stats["down"], rcq_config, model_name=model_name, layer_id=layer_id, linear_type="down", rank=rank)
+    q_down = _quantize_linear_set(
+        down_weights,
+        stats["down"],
+        rcq_config,
+        model_name=model_name,
+        layer_id=layer_id,
+        linear_type="down",
+        rank=rank,
+        shared_mode=down_shared_mode,
+        moment_mode=down_moment_mode,
+    )
     q_experts = OfficialQwen35MoeRCQExperts(
         num_experts=experts.num_experts,
         hidden_dim=experts.hidden_dim,
@@ -415,6 +467,8 @@ def convert_official_qwen35_moe_to_rcq(
     model_name: str = "official-qwen3.5-moe",
     rank: int | None = None,
     fit_correction: bool = True,
+    down_shared_mode: str = "right_input",
+    down_moment_mode: str = "global",
 ) -> nn.Module:
     """Deep-copy and convert official Transformers Qwen3.5-MoE experts to RCQ."""
     return convert_official_qwen35_moe_to_rcq_with_diagnostics(
@@ -425,6 +479,8 @@ def convert_official_qwen35_moe_to_rcq(
         model_name=model_name,
         rank=rank,
         fit_correction=fit_correction,
+        down_shared_mode=down_shared_mode,
+        down_moment_mode=down_moment_mode,
     ).model
 
 
@@ -437,6 +493,8 @@ def convert_official_qwen35_moe_to_rcq_with_diagnostics(
     model_name: str = "official-qwen3.5-moe",
     rank: int | None = None,
     fit_correction: bool = True,
+    down_shared_mode: str = "right_input",
+    down_moment_mode: str = "global",
 ) -> OfficialQwen35RCQConversionResult:
     """Deep-copy and convert official Transformers Qwen3.5-MoE experts to RCQ with diagnostics."""
     model.eval()
@@ -453,6 +511,8 @@ def convert_official_qwen35_moe_to_rcq_with_diagnostics(
             model_name=model_name,
             layer_id=layer_id,
             rank=rank,
+            down_shared_mode=down_shared_mode,
+            down_moment_mode=down_moment_mode,
         )
         before = None
         after = None

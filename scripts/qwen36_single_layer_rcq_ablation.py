@@ -87,7 +87,9 @@ class LoadedLayer:
 class StreamingStats:
     covariance_sum: torch.Tensor
     moment_sum: torch.Tensor
+    per_expert_moment_sum: torch.Tensor
     expert_usage: torch.Tensor
+    selected_count: torch.Tensor
     total_weight: torch.Tensor
     block_size: int
     model_name: str
@@ -110,7 +112,9 @@ class StreamingStats:
         return cls(
             covariance_sum=torch.zeros((input_dim, input_dim), dtype=torch.float32, device=device),
             moment_sum=torch.zeros((padded_dim // block_size, block_size), dtype=torch.float32, device=device),
+            per_expert_moment_sum=torch.zeros((num_experts, padded_dim // block_size, block_size), dtype=torch.float32, device=device),
             expert_usage=torch.zeros(num_experts, dtype=torch.float32, device=device),
+            selected_count=torch.zeros(num_experts, dtype=torch.float32, device=device),
             total_weight=torch.zeros((), dtype=torch.float32, device=device),
             block_size=block_size,
             model_name=model_name,
@@ -126,6 +130,7 @@ class StreamingStats:
         weighted = acts * weights[:, None]
         self.covariance_sum += acts.T @ weighted
         self.expert_usage[expert_id] += weights.sum()
+        self.selected_count[expert_id] += acts.shape[0]
         self.total_weight += weights.sum()
 
         padded, _ = pad_last_dim(acts, self.block_size)
@@ -141,14 +146,28 @@ class StreamingStats:
                 dtype=acts.dtype,
             )
             rotated = rotate_activation_block(blocks[:, block_index, :], q)
-            self.moment_sum[block_index] += (weights[:, None] * rotated.square()).sum(dim=0)
+            contribution = (weights[:, None] * rotated.square()).sum(dim=0)
+            self.moment_sum[block_index] += contribution
+            self.per_expert_moment_sum[expert_id, block_index] += contribution
 
     def finish(self) -> LinearCalibrationStats:
         denom = self.total_weight.clamp_min(1e-12)
         covariance = self.covariance_sum / denom
         moments = self.moment_sum / denom
         importance = self.expert_usage / self.expert_usage.sum().clamp_min(1e-12)
-        return LinearCalibrationStats(covariance=covariance, expert_importance=importance, rotated_second_moments=moments)
+        cond = self.per_expert_moment_sum / self.expert_usage.clamp_min(1e-12).view(-1, 1, 1)
+        shrink = self.selected_count / (self.selected_count + 4096.0)
+        per_expert = shrink.view(-1, 1, 1) * cond + (1.0 - shrink).view(-1, 1, 1) * moments
+        per_expert = torch.nan_to_num(per_expert, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        return LinearCalibrationStats(
+            covariance=covariance,
+            expert_importance=importance,
+            rotated_second_moments=moments,
+            per_expert_rotated_second_moments=per_expert,
+            per_expert_router_z=self.expert_usage,
+            per_expert_selected_count=self.selected_count,
+            global_rotated_second_moments=moments,
+        )
 
 
 @dataclass
@@ -157,6 +176,9 @@ class QuantizedLinear:
     residuals: list[torch.Tensor]
     widths: torch.Tensor
     bpw: float
+    shared_mode: str = "right_input"
+    residual_config: str | None = None
+    moment_mode: str = "global"
 
     def weight_for_expert(self, expert_id: int) -> torch.Tensor:
         shared = self.decomposition.a_factors[expert_id] @ self.decomposition.b_shared
@@ -1084,6 +1106,16 @@ def _binary_quantize(z: torch.Tensor, moments: torch.Tensor, *, weighted_scale: 
     return values, score
 
 
+def _moments_for_expert(moments: torch.Tensor, expert_id: int, transformed: torch.Tensor) -> torch.Tensor:
+    if moments.ndim == 2:
+        return moments.to(device=transformed.device, dtype=transformed.dtype)[None, :, :].expand_as(transformed)
+    if moments.ndim == 3:
+        if expert_id >= moments.shape[0]:
+            raise ValueError("per-expert moments has fewer experts than residuals")
+        return moments[expert_id].to(device=transformed.device, dtype=transformed.dtype)[None, :, :].expand_as(transformed)
+    raise ValueError("moments must have shape [blocks, h] or [experts, blocks, h]")
+
+
 def _quantize_residual_variant(
     residuals: list[torch.Tensor],
     moments: torch.Tensor,
@@ -1094,6 +1126,7 @@ def _quantize_residual_variant(
     model_name: str,
     layer_id: int,
     linear_type: str,
+    expert_score_weights: torch.Tensor | None = None,
 ) -> tuple[list[torch.Tensor], torch.Tensor]:
     if not residuals:
         raise ValueError("residuals must not be empty")
@@ -1102,7 +1135,12 @@ def _quantize_residual_variant(
     scores_by_expert: list[torch.Tensor] = []
     valid_cols: list[int] = []
 
-    for residual in residuals:
+    if expert_score_weights is not None:
+        expert_score_weights = expert_score_weights.to(device=residuals[0].device, dtype=torch.float32)
+        if expert_score_weights.shape != (len(residuals),):
+            raise ValueError("expert_score_weights must have shape [num_experts]")
+
+    for expert_id, residual in enumerate(residuals):
         padded, valid = pad_last_dim(residual.float(), block_size)
         blocks = padded.reshape(residual.shape[0], -1, block_size)
         if use_hadamard:
@@ -1112,8 +1150,10 @@ def _quantize_residual_variant(
                 transformed[:, block_index, :] = blocks[:, block_index, :] @ q
         else:
             transformed = blocks
-        expanded_moments = moments.to(device=transformed.device, dtype=transformed.dtype)[None, :, :].expand_as(transformed)
+        expanded_moments = _moments_for_expert(moments, expert_id, transformed)
         values, scores = _binary_quantize(transformed, expanded_moments, weighted_scale=weighted_scale)
+        if expert_score_weights is not None:
+            scores = scores * expert_score_weights[expert_id]
         values_by_expert.append(values)
         scores_by_expert.append(scores)
         valid_cols.append(valid)
@@ -1132,7 +1172,7 @@ def _quantize_residual_variant(
                     transformed_fp[:, block_index, :] = fp_blocks[:, block_index, :] @ q
             else:
                 transformed_fp = fp_blocks
-            expanded_moments = moments.to(device=transformed_fp.device, dtype=transformed_fp.dtype)[None, :, :].expand_as(transformed_fp)
+            expanded_moments = _moments_for_expert(moments, expert_id, transformed_fp)
             for bits in (2, 4):
                 mask = widths[expert_id] == bits
                 if mask.any():
@@ -1153,6 +1193,23 @@ def _quantize_residual_variant(
     return dequant_residuals, widths
 
 
+def _no_shared_decomposition(weights: list[torch.Tensor]) -> SharedDecomposition:
+    if not weights:
+        raise ValueError("weights must not be empty")
+    rows, cols = weights[0].shape
+    device = weights[0].device
+    dtype = weights[0].dtype
+    return SharedDecomposition(
+        a_factors=[torch.empty((rows, 0), dtype=dtype, device=device) for _ in weights],
+        b_shared=torch.empty((0, cols), dtype=dtype, device=device),
+        residuals=[weight.clone() for weight in weights],
+        eigvals=torch.empty(0, dtype=dtype, device=device),
+        eigvecs=torch.empty((cols, 0), dtype=dtype, device=device),
+        v_r=torch.empty((cols, 0), dtype=dtype, device=device),
+        captured_energy=0.0,
+    )
+
+
 def quantize_linear(
     weights: torch.Tensor,
     stats: LinearCalibrationStats,
@@ -1164,28 +1221,53 @@ def quantize_linear(
     model_name: str,
     layer_id: int,
     linear_type: str,
+    shared_mode: str = "right_input",
+    moment_mode: str = "global",
+    expert_score_weights: torch.Tensor | None = None,
 ) -> QuantizedLinear:
     expert_weights = [weights[expert_id].float() for expert_id in range(weights.shape[0])]
-    decomposition = decompose_shared_subspace(expert_weights, stats.covariance.float(), stats.expert_importance.float(), rank=rank)
+    if shared_mode == "right_input":
+        decomposition = decompose_shared_subspace(expert_weights, stats.covariance.float(), stats.expert_importance.float(), rank=rank)
+    elif shared_mode == "none":
+        decomposition = _no_shared_decomposition(expert_weights)
+    else:
+        raise ValueError(f"unsupported shared_mode: {shared_mode!r}")
+    if moment_mode == "global":
+        moments = stats.rotated_second_moments.float()
+    elif moment_mode == "per_expert":
+        if stats.per_expert_rotated_second_moments is None:
+            raise ValueError("per_expert moment_mode requires per_expert_rotated_second_moments")
+        moments = stats.per_expert_rotated_second_moments.float()
+    else:
+        raise ValueError(f"unsupported moment_mode: {moment_mode!r}")
     residuals, widths = _quantize_residual_variant(
         decomposition.residuals,
-        stats.rotated_second_moments.float(),
+        moments,
         use_hadamard=use_hadamard,
         weighted_scale=weighted_scale,
         rescue_config=rescue_config,
         model_name=model_name,
         layer_id=layer_id,
         linear_type=linear_type,
+        expert_score_weights=expert_score_weights,
     )
     report = expert_bpw(
         num_experts=weights.shape[0],
         rows=weights.shape[1],
         cols=weights.shape[2],
-        rank=rank,
+        rank=decomposition.b_shared.shape[0],
         widths=widths,
-        block_size=stats.rotated_second_moments.shape[-1],
+        block_size=moments.shape[-1],
     )
-    return QuantizedLinear(decomposition=decomposition, residuals=residuals, widths=widths, bpw=report.bpw)
+    return QuantizedLinear(
+        decomposition=decomposition,
+        residuals=residuals,
+        widths=widths,
+        bpw=report.bpw,
+        shared_mode=shared_mode,
+        residual_config=rescue_config.name if rescue_config is not None else None,
+        moment_mode=moment_mode,
+    )
 
 
 def build_q_moe(
@@ -1196,11 +1278,22 @@ def build_q_moe(
     use_hadamard: bool,
     weighted_scale: bool,
     rescue_config: RescueConfig | None,
+    gate_rescue_config: RescueConfig | None = None,
+    up_rescue_config: RescueConfig | None = None,
+    down_rescue_config: RescueConfig | None = None,
+    down_shared_mode: str = "right_input",
+    down_moment_mode: str = "global",
 ) -> QuantizedMoe:
+    gate_rescue_config = rescue_config if gate_rescue_config is None else gate_rescue_config
+    up_rescue_config = rescue_config if up_rescue_config is None else up_rescue_config
+    down_rescue_config = rescue_config if down_rescue_config is None else down_rescue_config
     _log(
         "build_q_moe start "
         f"rank_divisor={rank_divisor} use_hadamard={use_hadamard} "
-        f"weighted_scale={weighted_scale} rescue={rescue_config.name if rescue_config else None}",
+        f"weighted_scale={weighted_scale} gate_rescue={gate_rescue_config.name if gate_rescue_config else None} "
+        f"up_rescue={up_rescue_config.name if up_rescue_config else None} "
+        f"down_rescue={down_rescue_config.name if down_rescue_config else None} "
+        f"down_shared_mode={down_shared_mode} down_moment_mode={down_moment_mode}",
         force=True,
     )
     started = time.time()
@@ -1209,14 +1302,27 @@ def build_q_moe(
     kwargs = {
         "use_hadamard": use_hadamard,
         "weighted_scale": weighted_scale,
-        "rescue_config": rescue_config,
         "model_name": "qwen36-single-layer",
         "layer_id": 0,
     }
+    down_score_weights = None
+    if down_moment_mode == "per_expert":
+        importance = stats["down"].expert_importance.float()
+        down_score_weights = 0.5 * importance + 0.5 / importance.numel()
     q_moe = QuantizedMoe(
-        gate=quantize_linear(layer.gate_weight, stats["gate"], rank=rank_hidden, linear_type="gate", **kwargs),
-        up=quantize_linear(layer.up_weight, stats["up"], rank=rank_hidden, linear_type="up", **kwargs),
-        down=quantize_linear(layer.down_weight, stats["down"], rank=rank_intermediate, linear_type="down", **kwargs),
+        gate=quantize_linear(layer.gate_weight, stats["gate"], rank=rank_hidden, linear_type="gate", rescue_config=gate_rescue_config, **kwargs),
+        up=quantize_linear(layer.up_weight, stats["up"], rank=rank_hidden, linear_type="up", rescue_config=up_rescue_config, **kwargs),
+        down=quantize_linear(
+            layer.down_weight,
+            stats["down"],
+            rank=rank_intermediate,
+            linear_type="down",
+            rescue_config=down_rescue_config,
+            shared_mode=down_shared_mode,
+            moment_mode=down_moment_mode,
+            expert_score_weights=down_score_weights,
+            **kwargs,
+        ),
     )
     _log(f"build_q_moe done elapsed_sec={time.time() - started:.1f}", force=True)
     return q_moe
@@ -1407,18 +1513,31 @@ def _diagnostics(q_moe: QuantizedMoe) -> dict[str, Any]:
             "captured_energy": q_moe.gate.decomposition.captured_energy,
             "bpw": q_moe.gate.bpw,
             "width_percentages": _width_percentages(q_moe.gate),
+            "shared_mode": q_moe.gate.shared_mode,
+            "residual_config": q_moe.gate.residual_config,
+            "moment_mode": q_moe.gate.moment_mode,
         },
         "up": {
             "captured_energy": q_moe.up.decomposition.captured_energy,
             "bpw": q_moe.up.bpw,
             "width_percentages": _width_percentages(q_moe.up),
+            "shared_mode": q_moe.up.shared_mode,
+            "residual_config": q_moe.up.residual_config,
+            "moment_mode": q_moe.up.moment_mode,
         },
         "down": {
             "captured_energy": q_moe.down.decomposition.captured_energy,
             "bpw": q_moe.down.bpw,
             "width_percentages": _width_percentages(q_moe.down),
+            "shared_mode": q_moe.down.shared_mode,
+            "residual_config": q_moe.down.residual_config,
+            "moment_mode": q_moe.down.moment_mode,
         },
     }
+
+
+def _average_expert_bpw(q_moe: QuantizedMoe) -> float:
+    return float((q_moe.gate.bpw + q_moe.up.bpw + q_moe.down.bpw) / 3.0)
 
 
 def run_ablation(
@@ -1438,6 +1557,11 @@ def run_ablation(
     device: torch.device,
     include_shared: bool,
     activation_source: str,
+    gate_rescue_config: RescueConfig | None = None,
+    up_rescue_config: RescueConfig | None = None,
+    down_rescue_config: RescueConfig | None = None,
+    down_shared_mode: str = "right_input",
+    down_moment_mode: str = "global",
 ) -> dict[str, Any]:
     _log(f"ablation start label={label}", force=True)
     started = time.time()
@@ -1448,6 +1572,11 @@ def run_ablation(
         use_hadamard=use_hadamard,
         weighted_scale=weighted_scale,
         rescue_config=rescue_config,
+        gate_rescue_config=gate_rescue_config,
+        up_rescue_config=up_rescue_config,
+        down_rescue_config=down_rescue_config,
+        down_shared_mode=down_shared_mode,
+        down_moment_mode=down_moment_mode,
     )
     correction = None
     if fit_correction:
@@ -1488,6 +1617,16 @@ def run_ablation(
         "use_hadamard": use_hadamard,
         "weighted_scale": weighted_scale,
         "rescue_config": rescue_config.name if rescue_config is not None else None,
+        "gate_residual_config": q_moe.gate.residual_config,
+        "up_residual_config": q_moe.up.residual_config,
+        "down_residual_config": q_moe.down.residual_config,
+        "down_shared_mode": q_moe.down.shared_mode,
+        "down_moment_mode": q_moe.down.moment_mode,
+        "down_sequential_stats": False,
+        "gate_bpw": q_moe.gate.bpw,
+        "up_bpw": q_moe.up.bpw,
+        "down_bpw": q_moe.down.bpw,
+        "average_expert_bpw": _average_expert_bpw(q_moe),
         "fit_routed_moe_output_correction": fit_correction,
         "correction": correction,
         "calibration": calib,
@@ -1519,6 +1658,11 @@ def run_ablation_cached(
     include_shared: bool,
     calib_reference_stats: dict[str, float] | None = None,
     heldout_reference_stats: dict[str, float] | None = None,
+    gate_rescue_config: RescueConfig | None = None,
+    up_rescue_config: RescueConfig | None = None,
+    down_rescue_config: RescueConfig | None = None,
+    down_shared_mode: str = "right_input",
+    down_moment_mode: str = "global",
 ) -> dict[str, Any]:
     _log(f"ablation start label={label}", force=True)
     started = time.time()
@@ -1529,6 +1673,11 @@ def run_ablation_cached(
         use_hadamard=use_hadamard,
         weighted_scale=weighted_scale,
         rescue_config=rescue_config,
+        gate_rescue_config=gate_rescue_config,
+        up_rescue_config=up_rescue_config,
+        down_rescue_config=down_rescue_config,
+        down_shared_mode=down_shared_mode,
+        down_moment_mode=down_moment_mode,
     )
     correction = None
     if fit_correction:
@@ -1563,6 +1712,16 @@ def run_ablation_cached(
         "use_hadamard": use_hadamard,
         "weighted_scale": weighted_scale,
         "rescue_config": rescue_config.name if rescue_config is not None else None,
+        "gate_residual_config": q_moe.gate.residual_config,
+        "up_residual_config": q_moe.up.residual_config,
+        "down_residual_config": q_moe.down.residual_config,
+        "down_shared_mode": q_moe.down.shared_mode,
+        "down_moment_mode": q_moe.down.moment_mode,
+        "down_sequential_stats": False,
+        "gate_bpw": q_moe.gate.bpw,
+        "up_bpw": q_moe.up.bpw,
+        "down_bpw": q_moe.down.bpw,
+        "average_expert_bpw": _average_expert_bpw(q_moe),
         "fit_routed_moe_output_correction": fit_correction,
         "correction": correction,
         "calibration": calib,
@@ -1576,6 +1735,66 @@ def run_ablation_cached(
         torch.cuda.empty_cache()
     _log(f"ablation done label={label} heldout_mse={heldout['mse']:.6g} elapsed_sec={payload['elapsed_sec']:.1f}", force=True)
     return payload
+
+
+def _down_v2_experiments(block_size: int) -> list[tuple[str, dict[str, Any] | str]]:
+    """Down-projection V2 rows from FIX_DOWN_PROJ_SPEC.md.
+
+    This slice runs D0/D3/D4 locally. Left-output rows remain explicit not-run
+    entries until their decomposition and sequential stats are implemented.
+    """
+    return [
+        (
+            "D0_current_baseline_legacy_right_rcq_1p75_correction",
+            dict(
+                stats_kind="weighted",
+                rank_divisor=128,
+                use_hadamard=True,
+                weighted_scale=True,
+                rescue_config=RescueConfig.rcq_1p75(block_size),
+                fit_correction=True,
+                down_shared_mode="right_input",
+                down_moment_mode="global",
+            ),
+        ),
+        ("D1_gate_up_quantized_down_fp", "not_run:partial-projection attribution is scheduled after the D3/D4 plumbing row"),
+        ("D2_down_quantized_gate_up_fp", "not_run:partial-projection attribution is scheduled after the D3/D4 plumbing row"),
+        (
+            "D3_gate_up_1p55_down_none_min2_5p4_correction",
+            dict(
+                stats_kind="weighted",
+                rank_divisor=128,
+                use_hadamard=True,
+                weighted_scale=True,
+                rescue_config=None,
+                gate_rescue_config=RescueConfig.rcq_1p55(block_size),
+                up_rescue_config=RescueConfig.rcq_1p55(block_size),
+                down_rescue_config=RescueConfig.down_min2_5p4(block_size),
+                down_shared_mode="none",
+                down_moment_mode="per_expert",
+                fit_correction=True,
+            ),
+        ),
+        (
+            "D4_gate_up_1p55_down_none_min2_20p4_correction",
+            dict(
+                stats_kind="weighted",
+                rank_divisor=128,
+                use_hadamard=True,
+                weighted_scale=True,
+                rescue_config=None,
+                gate_rescue_config=RescueConfig.rcq_1p55(block_size),
+                up_rescue_config=RescueConfig.rcq_1p55(block_size),
+                down_rescue_config=RescueConfig.down_min2_20p4(block_size),
+                down_shared_mode="none",
+                down_moment_mode="per_expert",
+                fit_correction=True,
+            ),
+        ),
+        ("D5_gate_up_1p55_down_left_output_mix_1bit", "not_run:left_output sequential down calibration is not implemented in this slice"),
+        ("D6_gate_up_1p55_down_left_output_min2_5p4", "not_run:left_output sequential down calibration is not implemented in this slice"),
+        ("D7_gate_up_1p75_down_left_output_min2_20p4", "not_run:left_output sequential down calibration is not implemented in this slice"),
+    ]
 
 
 def main() -> None:
@@ -1785,6 +2004,7 @@ def main() -> None:
         ("grouped_subspaces_G1_G2_G4_G8", "not_available"),
         ("per_linear_output_affine_correction", "not_available"),
     ]
+    experiments.extend(_down_v2_experiments(args.block_size))
     if args.max_experiments is not None:
         experiments = experiments[: args.max_experiments]
 
@@ -1837,6 +2057,8 @@ def main() -> None:
             results.append({"label": label, "status": "ok", "calibration": calib, "heldout": heldout})
         elif spec == "not_available":
             results.append({"label": label, "status": "not_available", "reason": "not implemented in this prototype slice"})
+        elif isinstance(spec, str) and spec.startswith("not_run:"):
+            results.append({"label": label, "status": "not_run", "reason": spec.split(":", 1)[1]})
         else:
             spec = dict(spec)
             stats = get_stats(str(spec.pop("stats_kind")))

@@ -20,6 +20,7 @@ class RescueConfig:
     next_2bit: float
     block_size: int = 64
     scale_bits: int = 16
+    min_bit: Literal[1, 2] = 1
 
     @staticmethod
     def rcq_1p55(block_size: int = 64, scale_bits: int = 16) -> "RescueConfig":
@@ -32,6 +33,18 @@ class RescueConfig:
     @staticmethod
     def rcq_1p90(block_size: int = 64, scale_bits: int = 16) -> "RescueConfig":
         return RescueConfig("rcq_1p90", top_4bit=0.05, next_2bit=0.35, block_size=block_size, scale_bits=scale_bits)
+
+    @staticmethod
+    def down_mix_1bit(block_size: int = 64, scale_bits: int = 16) -> "RescueConfig":
+        return RescueConfig("down_mix_1bit", top_4bit=0.05, next_2bit=0.20, block_size=block_size, scale_bits=scale_bits)
+
+    @staticmethod
+    def down_min2_5p4(block_size: int = 64, scale_bits: int = 16) -> "RescueConfig":
+        return RescueConfig("down_min2_5p4", top_4bit=0.05, next_2bit=0.95, block_size=block_size, scale_bits=scale_bits, min_bit=2)
+
+    @staticmethod
+    def down_min2_20p4(block_size: int = 64, scale_bits: int = 16) -> "RescueConfig":
+        return RescueConfig("down_min2_20p4", top_4bit=0.20, next_2bit=0.80, block_size=block_size, scale_bits=scale_bits, min_bit=2)
 
 
 @dataclass
@@ -116,18 +129,32 @@ def select_rescue_widths(scores: torch.Tensor, config: RescueConfig) -> torch.Te
     """Select 4-bit and 2-bit row-blocks globally by score."""
     flat_scores = scores.reshape(-1)
     total = flat_scores.numel()
-    widths = torch.ones(total, dtype=torch.int64, device=scores.device)
+    widths = torch.full((total,), config.min_bit, dtype=torch.int64, device=scores.device)
     if total == 0:
         return widths.reshape_as(scores)
+    if config.min_bit not in (1, 2):
+        raise ValueError(f"min_bit must be 1 or 2, got {config.min_bit}.")
 
     n_4bit = round(total * config.top_4bit)
     n_2bit = round(total * config.next_2bit)
     order = torch.argsort(flat_scores, descending=True)
     if n_4bit:
         widths[order[:n_4bit]] = 4
-    if n_2bit:
+    if config.min_bit == 1 and n_2bit:
         widths[order[n_4bit : n_4bit + n_2bit]] = 2
     return widths.reshape_as(scores)
+
+
+def _moments_for_expert(rotated_second_moments: torch.Tensor, expert_id: int, rotated: torch.Tensor) -> torch.Tensor:
+    if rotated_second_moments.ndim == 2:
+        moments = rotated_second_moments[None, :, :].expand_as(rotated)
+    elif rotated_second_moments.ndim == 3:
+        if expert_id >= rotated_second_moments.shape[0]:
+            raise ValueError("per-expert rotated_second_moments has fewer experts than residuals.")
+        moments = rotated_second_moments[expert_id][None, :, :].expand_as(rotated)
+    else:
+        raise ValueError("rotated_second_moments must have shape [blocks, h] or [experts, blocks, h].")
+    return moments
 
 
 def _rotate_residual_blocks(
@@ -164,6 +191,7 @@ def quantize_residuals(
     model_name: str = "prototype",
     layer_id: int = 0,
     linear_type: str = "up",
+    expert_score_weights: torch.Tensor | None = None,
 ) -> list[QuantizedResidual]:
     """Quantize all expert residuals for one layer+linear type."""
     if not residuals:
@@ -172,13 +200,19 @@ def quantize_residuals(
     rotated_second_moments = rotated_second_moments.to(device=residuals[0].device, dtype=residuals[0].dtype)
     if rotated_second_moments.shape[-1] != block_size:
         raise ValueError("rotated_second_moments final dimension must match block_size.")
+    if rotated_second_moments.ndim == 3 and rotated_second_moments.shape[0] != len(residuals):
+        raise ValueError("per-expert rotated_second_moments must have one entry per residual expert.")
+    if expert_score_weights is not None:
+        expert_score_weights = expert_score_weights.to(device=residuals[0].device, dtype=residuals[0].dtype)
+        if expert_score_weights.shape != (len(residuals),):
+            raise ValueError("expert_score_weights must have shape [num_experts].")
 
     rotated_by_expert: list[torch.Tensor] = []
     scales_by_expert: list[torch.Tensor] = []
     scores_by_expert: list[torch.Tensor] = []
     valid_cols_by_expert: list[int] = []
 
-    for residual in residuals:
+    for expert_id, residual in enumerate(residuals):
         rotated, valid_cols = _rotate_residual_blocks(
             residual,
             model_name=model_name,
@@ -186,8 +220,10 @@ def quantize_residuals(
             linear_type=linear_type,
             block_size=block_size,
         )
-        moments = rotated_second_moments[None, :, :].expand_as(rotated)
+        moments = _moments_for_expert(rotated_second_moments, expert_id, rotated)
         dequant, scales, scores = binary_quantize_block(rotated, moments)
+        if expert_score_weights is not None:
+            scores = scores * expert_score_weights[expert_id]
         rotated_by_expert.append(dequant)
         scales_by_expert.append(scales)
         scores_by_expert.append(scores)
@@ -208,7 +244,7 @@ def quantize_residuals(
         values = rotated_by_expert[expert_id].clone()
         scales = scales_by_expert[expert_id].clone()
         widths = all_widths[expert_id]
-        moments = rotated_second_moments[None, :, :].expand_as(rotated_fp)
+        moments = _moments_for_expert(rotated_second_moments, expert_id, rotated_fp)
 
         for bits in (2, 4):
             mask = widths == bits
@@ -232,4 +268,3 @@ def quantize_residuals(
             )
         )
     return quantized
-

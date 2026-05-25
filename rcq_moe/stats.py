@@ -12,6 +12,10 @@ class LinearCalibrationStats:
     covariance: torch.Tensor
     expert_importance: torch.Tensor
     rotated_second_moments: torch.Tensor
+    per_expert_rotated_second_moments: torch.Tensor | None = None
+    per_expert_router_z: torch.Tensor | None = None
+    per_expert_selected_count: torch.Tensor | None = None
+    global_rotated_second_moments: torch.Tensor | None = None
 
 
 def accumulate_covariance_and_moments(
@@ -41,6 +45,8 @@ def accumulate_covariance_and_moments(
     padded_dim = ((input_dim + block_size - 1) // block_size) * block_size
     num_blocks = padded_dim // block_size
     moment_sum = torch.zeros((num_blocks, block_size), dtype=dtype, device=device)
+    per_expert_moment_sum = torch.zeros((num_experts, num_blocks, block_size), dtype=dtype, device=device)
+    selected_count = torch.zeros(num_experts, dtype=dtype, device=device)
     total_weight = torch.zeros((), dtype=dtype, device=device)
 
     for expert_id in range(num_experts):
@@ -48,6 +54,7 @@ def accumulate_covariance_and_moments(
             weight = router_weight.square()
             covariance_sum += weight * torch.outer(activation, activation)
             expert_usage[expert_id] += weight
+            selected_count[expert_id] += 1
             total_weight += weight
 
             padded, _ = pad_last_dim(activation, block_size)
@@ -64,8 +71,21 @@ def accumulate_covariance_and_moments(
                 )
                 rotated = rotate_activation_block(blocks[block_index], q)
                 moment_sum[block_index] += weight * rotated.square()
+                per_expert_moment_sum[expert_id, block_index] += weight * rotated.square()
 
     covariance = covariance_sum / (total_weight + eps)
     rotated_second_moments = moment_sum / (total_weight + eps)
     importance = expert_usage / (expert_usage.sum() + eps)
-    return LinearCalibrationStats(covariance, importance, rotated_second_moments)
+    cond = per_expert_moment_sum / expert_usage.clamp_min(eps).view(num_experts, 1, 1)
+    shrink = selected_count / (selected_count + 4096.0)
+    per_expert_moments = shrink.view(num_experts, 1, 1) * cond + (1.0 - shrink).view(num_experts, 1, 1) * rotated_second_moments
+    per_expert_moments = torch.nan_to_num(per_expert_moments, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+    return LinearCalibrationStats(
+        covariance,
+        importance,
+        rotated_second_moments,
+        per_expert_rotated_second_moments=per_expert_moments,
+        per_expert_router_z=expert_usage,
+        per_expert_selected_count=selected_count,
+        global_rotated_second_moments=rotated_second_moments,
+    )

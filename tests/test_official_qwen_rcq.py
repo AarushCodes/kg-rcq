@@ -85,3 +85,25 @@ def test_low_rank_official_qwen_rcq_conversion_runs_and_has_finite_kl():
     assert all(torch.isfinite(torch.tensor(value)) for value in summary.values())
     assert summary["mean"] >= 0.0
 
+
+def test_official_qwen_rcq_conversion_runs_with_down_none_mode():
+    torch.manual_seed(20)
+    model = make_tiny_official_qwen35_moe(vocab_size=32, hidden_size=8, moe_intermediate_size=8, num_hidden_layers=1)
+    calibration_ids = torch.randint(0, model.config.vocab_size, (3, 4))
+    eval_ids = torch.randint(0, model.config.vocab_size, (2, 4))
+
+    q_model = convert_official_qwen35_moe_to_rcq(
+        model,
+        calibration_ids,
+        RescueConfig.down_min2_5p4(block_size=8),
+        rank=4,
+        fit_correction=False,
+        down_shared_mode="none",
+        down_moment_mode="per_expert",
+    )
+    logits = q_model(input_ids=eval_ids, use_cache=False).logits
+
+    assert isinstance(q_model.model.layers[0].mlp, OfficialQwen35MoeRCQSparseMoeBlock)
+    assert q_model.model.layers[0].mlp.experts.q_down.shared_mode == "none"
+    assert int((q_model.model.layers[0].mlp.experts.q_down.q_residuals[0].widths == 1).sum()) == 0
+    assert torch.isfinite(logits).all()

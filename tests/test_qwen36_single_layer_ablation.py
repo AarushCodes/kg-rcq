@@ -3,10 +3,12 @@ from __future__ import annotations
 import torch
 
 from rcq_moe.stats import LinearCalibrationStats
+from rcq_moe.quantization import RescueConfig
 from scripts.qwen36_single_layer_rcq_ablation import (
     CachedBatch,
     LoadedLayer,
     _add_nmse_to_summary,
+    _down_v2_experiments,
     _fp_output_stats,
     build_q_moe,
     evaluate_docs,
@@ -136,6 +138,86 @@ def test_single_layer_ablation_core_runs_on_tiny_weights() -> None:
     assert summary["mse"] >= 0.0
     assert summary["rmse"] >= 0.0
     assert summary["max_abs"] >= 0.0
+
+
+def test_down_v2_experiment_rows_and_none_mode_bpw_fields() -> None:
+    rows = dict(_down_v2_experiments(block_size=4))
+    assert set(rows) >= {
+        "D0_current_baseline_legacy_right_rcq_1p75_correction",
+        "D3_gate_up_1p55_down_none_min2_5p4_correction",
+        "D4_gate_up_1p55_down_none_min2_20p4_correction",
+        "D7_gate_up_1p75_down_left_output_min2_20p4",
+    }
+    assert rows["D3_gate_up_1p55_down_none_min2_5p4_correction"]["down_shared_mode"] == "none"
+    assert rows["D3_gate_up_1p55_down_none_min2_5p4_correction"]["down_moment_mode"] == "per_expert"
+    assert rows["D3_gate_up_1p55_down_none_min2_5p4_correction"]["down_rescue_config"].name == "down_min2_5p4"
+    assert isinstance(rows["D7_gate_up_1p75_down_left_output_min2_20p4"], str)
+
+
+def test_build_q_moe_down_none_uses_min2_widths() -> None:
+    torch.manual_seed(2)
+    num_experts = 2
+    hidden = 8
+    intermediate = 6
+    block = 4
+    layer = LoadedLayer(
+        embed_tokens=torch.randn(16, hidden),
+        input_norm_weight=torch.zeros(hidden),
+        post_attention_norm_weight=torch.zeros(hidden),
+        q_proj_weight=torch.randn(2 * hidden, hidden),
+        q_proj_bias=None,
+        k_proj_weight=torch.randn(hidden, hidden),
+        k_proj_bias=None,
+        v_proj_weight=torch.randn(hidden, hidden),
+        v_proj_bias=None,
+        o_proj_weight=torch.randn(hidden, hidden),
+        o_proj_bias=None,
+        q_norm_weight=torch.zeros(hidden),
+        k_norm_weight=torch.zeros(hidden),
+        router_weight=torch.randn(num_experts, hidden),
+        gate_weight=torch.randn(num_experts, intermediate, hidden),
+        up_weight=torch.randn(num_experts, intermediate, hidden),
+        down_weight=torch.randn(num_experts, hidden, intermediate),
+        shared_gate_weight=torch.randn(intermediate, hidden),
+        shared_up_weight=torch.randn(intermediate, hidden),
+        shared_down_weight=torch.randn(hidden, intermediate),
+        shared_expert_gate_weight=torch.randn(1, hidden),
+        hidden_act="silu",
+        rms_norm_eps=1e-6,
+        layer_type="full_attention",
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=hidden,
+        attention_bias=False,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 1.0},
+        top_k=1,
+    )
+    down_stats = _stats(num_experts, intermediate, hidden, block)
+    down_stats.per_expert_rotated_second_moments = torch.ones(num_experts, (intermediate + block - 1) // block, block)
+    stats = {
+        "gate": _stats(num_experts, hidden, intermediate, block),
+        "up": _stats(num_experts, hidden, intermediate, block),
+        "down": down_stats,
+    }
+
+    q_moe = build_q_moe(
+        layer,
+        stats,
+        rank_divisor=256,
+        use_hadamard=True,
+        weighted_scale=True,
+        rescue_config=None,
+        gate_rescue_config=None,
+        up_rescue_config=None,
+        down_rescue_config=RescueConfig.down_min2_5p4(block),
+        down_shared_mode="none",
+        down_moment_mode="per_expert",
+    )
+
+    assert q_moe.down.shared_mode == "none"
+    assert q_moe.down.decomposition.b_shared.shape[0] == 0
+    assert int((q_moe.down.widths == 1).sum()) == 0
+    assert q_moe.down.bpw > 0.0
 
 
 def test_true_layer0_attention_activation_path_runs_on_tiny_weights() -> None:

@@ -20,6 +20,7 @@ from .official_qwen import (
 def _linear_set_to_state(linear: OfficialQwen35RCQLinearSet, prefix: str) -> dict[str, torch.Tensor | int | float | str]:
     state: dict[str, torch.Tensor | int | float | str] = {
         f"{prefix}.num_experts": len(linear.q_residuals),
+        f"{prefix}.shared_mode": linear.shared_mode,
         f"{prefix}.b_shared": linear.decomposition.b_shared.detach().cpu(),
         f"{prefix}.eigvals": linear.decomposition.eigvals.detach().cpu(),
         f"{prefix}.eigvecs": linear.decomposition.eigvecs.detach().cpu(),
@@ -145,4 +146,3 @@ def load_official_qwen_rcq_artifact(input_dir: str | Path) -> nn.Module:
         layer.mlp = q_block
     model.eval()
     return model
-

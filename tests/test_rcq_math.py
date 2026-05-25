@@ -61,6 +61,44 @@ def test_quantize_residuals_selects_global_widths_and_dequantizes_shape():
         assert q.dequantize().shape == original.shape
 
 
+def test_down_min2_configs_assign_no_one_bit_blocks():
+    torch.manual_seed(2)
+    residuals = [torch.randn(5, 16), torch.randn(5, 16)]
+    moments = torch.ones(2, 8)
+
+    for config, fraction in (
+        (RescueConfig.down_min2_5p4(block_size=8), 0.05),
+        (RescueConfig.down_min2_20p4(block_size=8), 0.20),
+    ):
+        quantized = quantize_residuals(residuals, moments, config, model_name="tiny", layer_id=0, linear_type="down")
+        widths = torch.stack([q.widths for q in quantized], dim=0)
+        assert int((widths == 1).sum()) == 0
+        assert int((widths == 4).sum()) == round(widths.numel() * fraction)
+        assert int((widths == 2).sum()) == widths.numel() - round(widths.numel() * fraction)
+
+
+def test_quantize_residuals_accepts_per_expert_moments():
+    torch.manual_seed(3)
+    residuals = [torch.randn(3, 10), torch.randn(3, 10)]
+    moments = torch.stack([torch.ones(2, 8), torch.full((2, 8), 2.0)], dim=0)
+    config = RescueConfig.down_min2_5p4(block_size=8)
+
+    quantized = quantize_residuals(
+        residuals,
+        moments,
+        config,
+        model_name="tiny",
+        layer_id=0,
+        linear_type="down",
+        expert_score_weights=torch.tensor([0.75, 0.25]),
+    )
+
+    widths = torch.stack([q.widths for q in quantized], dim=0)
+    assert widths.shape == (2, 3, 2)
+    assert int((widths == 1).sum()) == 0
+    assert all(q.dequantize().shape == original.shape for q, original in zip(quantized, residuals))
+
+
 def test_storage_bpw_counts_padding_excluded_indices_and_shared_overhead():
     widths = torch.tensor([[[1, 4], [2, 1]], [[1, 1], [4, 2]]])
     report = expert_bpw(num_experts=2, rows=2, cols=10, rank=1, widths=widths, block_size=8)
@@ -68,4 +106,3 @@ def test_storage_bpw_counts_padding_excluded_indices_and_shared_overhead():
     assert report.shared_bits == 16 * (1 * 10 + 2 * 2 * 1)
     assert report.total_bits == report.shared_bits + report.index_bits + report.scale_bits + report.metadata_bits
     assert report.bpw == report.total_bits / 40
-
