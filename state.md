@@ -1,6 +1,6 @@
 # RCQ-MoE Prototype State
 
-Current date: 2026-05-24
+Current date: 2026-05-25
 
 ## Status
 
@@ -9,8 +9,10 @@ Transformers Qwen3.5-MoE tiny-model integration path, and a text-derived toy
 token harness with a real-tokenizer smoke path. It now also has local Kaggle
 script and notebook runners for a competition-attached Qwen3.6 FP-only smoke
 slice, plus a local one-shot Kaggle remote-control worker driven by reviewed
-JSON job specs. The repository now has a public-facing `README.MD` copied from
-the current README draft.
+JSON job specs. The active pretrained-compatible validation plan is now moving
+from Kaggle to a single AMD MI300X remote host with SSH, exact git commit
+checkout, remote-only model caches, and small local result pulls. The repository
+now has a public-facing `README.MD` copied from the current README draft.
 
 This is still a research/plumbing prototype:
 
@@ -160,6 +162,20 @@ This is still a research/plumbing prototype:
     outputs, pinned commit identity, small output artifacts, and no local copy
     of Qwen3.6 model weights.
 
+- MI300X remote workflow design:
+  - Adds `docs/specs/2026-05-25-mi300x-remote-workflow-design.md`.
+  - Chooses SSH-based remote execution on a single AMD MI300X as the active
+    validation path.
+  - Keeps local `main` and GitHub commits as the reviewed source of truth.
+  - Requires remote runs to check out an exact reviewed commit SHA.
+  - Keeps Hugging Face model weights, tokenizer cache, and large temporary
+    artifacts on the MI300X host.
+  - Pulls only small JSON/text summaries and logs back to local.
+  - Uses remote environment discipline that avoids replacing the image-provided
+    PyTorch 2.6 + ROCm 7.0 build with an incompatible wheel.
+  - Pauses Kaggle as a backend rather than deleting the existing Kaggle worker,
+    notebook, and job-spec code.
+
 - Public README:
   - Adds `README.MD`, synced from `readme_draft.md`.
   - Summarizes RCQ-MoE motivation, research goals, compression recipe,
@@ -307,6 +323,15 @@ so the README no longer presents the tiny/random KL value as a quality result.
 No tests were run because this was a documentation-only slice.
 ```
 
+Latest MI300X design slice:
+
+```text
+Added docs/specs/2026-05-25-mi300x-remote-workflow-design.md and updated
+state/structure to make MI300X the active remote validation path. No SSH command
+was run, no remote access was used, and no pretrained model weights were loaded.
+No tests were run because this was a documentation-only slice.
+```
+
 Latest text-token smoke command:
 
 ```bash
@@ -400,6 +425,7 @@ python3 scripts/build_text_fixture.py \
 ## Recent Commits Before This State Update
 
 ```text
+fa9d25e Record GitHub repo rename
 81a0599 Resync public README
 790d488 Add public README
 039b6c5 Record Kaggle offline bootstrap constraint
@@ -425,6 +451,8 @@ e872141 Add streamed text fixture builder
   RTX PRO 6000, so it is not the desired validation path for Slice 3.
 - The manually created RTX PRO 6000 Kaggle notebook currently has internet
   disabled, so the GitHub-clone worker path cannot run there as-is.
+- The MI300X path is designed but not yet executed; no SSH alias, remote
+  PyTorch/ROCm metadata, or remote dry-run output has been recorded yet.
 - No completed Kaggle Qwen3.6 FP smoke outputs have been pulled or interpreted.
 - Current artifact stores fake-dequant reference tensors, not packed bitstreams.
 - No FP8 scale/shared-factor storage.
@@ -435,33 +463,29 @@ e872141 Add streamed text fixture builder
 
 ## Recommended Next Milestone
 
-Continue the pretrained-compatible smoke path slice by slice:
+Continue the pretrained-compatible MI300X path slice by slice:
 
-1. Offline Kaggle bootstrap path for RTX PRO 6000.
-   - Keep GitHub as the reviewed source of truth.
-   - Add a way to provide the pinned worker/job bundle to an internet-disabled
-     Kaggle notebook.
-   - Preserve exact job JSON, pinned commit identity, small output artifacts,
-     and no local Qwen3.6 model files.
-2. Kaggle control-plane smoke.
-   - Run one `control_plane_smoke` job from Kaggle.
-   - Verify pinned worker/job identity, GPU/env visibility, and
-     `scripts/qwen36_fp_smoke.py --dry-run`.
+1. ROCm-aware FP smoke metadata.
+   - Patch `scripts/qwen36_fp_smoke.py` to record `torch.version.hip`,
+     `rocm-smi`, `rocminfo`, and device metadata without treating missing
+     `nvidia-smi` as a problem on ROCm.
+   - Keep the script compatible with CUDA and local CPU dry-runs.
+   - Run local tests.
+2. MI300X control-plane smoke.
+   - Use SSH to run `scripts/qwen36_fp_smoke.py --dry-run` from an exact pinned
+     commit on the MI300X host.
+   - Verify PyTorch, ROCm, GPU visibility, repo checkout, imports, and small
+     output writing.
    - Do not load Qwen weights in this slice.
-3. Competition-attached Kaggle Qwen3.6 FP-only smoke.
-   - Use a manually created Kaggle notebook for the RTX PRO 6000 allocation,
-     because the API-pushed notebook landed on P100.
-   - Attach `nvidia-nemotron-model-reasoning-challenge` and select RTX PRO 6000
-     in the Kaggle UI.
-   - Use the one-shot JSON job worker or its reviewed offline bootstrap
-     equivalent so the remote work remains peer-reviewable.
-   - Load `Qwen/Qwen3.6-35B-A3B` on Kaggle, not locally.
-   - Verify RTX PRO 6000 allocation with `nvidia-smi`.
+3. MI300X Qwen3.6 FP-only smoke.
+   - Load `Qwen/Qwen3.6-35B-A3B` on MI300X, not locally.
+   - Use the remote Hugging Face cache under the MI300X workspace.
    - Run tokenizer-driven FP-only eval and inspect/capture sparse MoE block
-     structure under `/kaggle/working/outputs/qwen36_fp_smoke`.
+     structure under the remote output directory.
+   - Pull only compact JSON/text/log outputs back to local.
    - Do not quantize in this slice.
-4. Slice 4: one-layer pretrained RCQ conversion.
+4. One-layer pretrained RCQ conversion.
    - Add layer-limited conversion if needed.
-   - Quantize exactly one Qwen3.6 MoE layer/block first on Kaggle.
+   - Quantize exactly one Qwen3.6 MoE layer/block first on MI300X.
    - Report FP-vs-one-layer-RCQ KL, routed MoE MSE before/after correction,
      expert bpw, artifact save/load exactness, and memory/runtime notes.

@@ -25,7 +25,8 @@ artifacts, not source files to modify.
 ├── uv.lock
 ├── docs/
 │   └── specs/
-│       └── 2026-05-24-kaggle-remote-control-design.md
+│       ├── 2026-05-24-kaggle-remote-control-design.md
+│       └── 2026-05-25-mi300x-remote-workflow-design.md
 ├── rcq_moe/
 │   ├── __init__.py
 │   ├── artifact.py
@@ -173,6 +174,28 @@ Contains:
   smoke.
 
 Use this as the reference when reviewing or extending the remote worker.
+
+### `docs/specs/2026-05-25-mi300x-remote-workflow-design.md`
+
+Approved design for moving the active pretrained-compatible validation path
+from Kaggle to a single AMD MI300X remote host.
+
+Contains:
+
+- SSH-based execution model with local `main` as the reviewed source of truth.
+- Exact commit checkout discipline for remote runs.
+- Remote directory layout for repo checkout, Hugging Face cache, outputs, and
+  logs.
+- Credential handling rules: no private keys, HF tokens, or cloud credentials in
+  source or chat logs.
+- ROCm/PyTorch environment guidance that avoids replacing the image-provided
+  PyTorch 2.6 + ROCm 7.0 build with an incompatible wheel.
+- Initial control-plane and FP-only Qwen3.6 smoke command shapes.
+- Required ROCm-aware metadata additions for `scripts/qwen36_fp_smoke.py`.
+- Slice plan through one-layer pretrained RCQ conversion.
+
+Use this as the reference for MI300X execution slices. Kaggle code remains in
+the repo as a paused backend, not the active validation path.
 
 ## `rcq_moe/`
 
